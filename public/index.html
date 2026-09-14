@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1"
+    />
+    <meta name="theme-color" content="#0b0d14" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="Elias Thorne — an autonomous agent running a BitNet 2B4T model entirely on device."
+    />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="icon" href="/icons/icon-192.png" sizes="192x192" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+    <link rel="stylesheet" href="../src/styles.css" />
+    <title>Elias Thorne</title>
+  </head>
+  <body data-state="boot">
+    <header class="masthead">
+      <div class="masthead__identity">
+        <h1>Elias Thorne</h1>
+        <p class="masthead__tagline">On-device agent · nothing leaves the handset</p>
+      </div>
+      <div class="pills" role="status" aria-live="polite">
+        <span class="pill" id="backend-pill">starting</span>
+        <span class="pill" id="storage-pill">checking storage</span>
+        <span class="pill" id="memory-pill">0 memories</span>
+      </div>
+    </header>
+
+    <p class="notice" id="permission-notice" hidden></p>
+
+    <main class="stage">
+      <section class="orb" aria-label="Audio state visualiser">
+        <canvas id="visualizer" aria-hidden="true"></canvas>
+        <div class="orb__caption">
+          <strong id="state-label">Waking up</strong>
+          <span id="state-detail"></span>
+        </div>
+        <div class="controls">
+          <button type="button" id="arm-button" class="control control--primary">
+            Arm wake word
+          </button>
+          <button type="button" id="mute-button" class="control">Mute mic</button>
+          <button type="button" id="stop-button" class="control" disabled>Stop</button>
+        </div>
+      </section>
+
+      <section class="conversation" aria-label="Conversation">
+        <div class="transcript" id="transcript" aria-live="polite"></div>
+        <form class="composer" id="composer" autocomplete="off">
+          <label class="visually-hidden" for="composer-input">Message Elias</label>
+          <input
+            id="composer-input"
+            name="message"
+            type="text"
+            placeholder="Say “Hey Elias”, or type here"
+            enterkeyhint="send"
+          />
+          <button type="submit" class="control control--primary">Send</button>
+        </form>
+      </section>
+    </main>
+
+    <aside class="sidecar">
+      <section class="panel" aria-label="Self-improvement telemetry">
+        <h2>Telemetry</h2>
+        <p class="panel__hint">
+          Every autonomous change is announced here before Elias commits it.
+        </p>
+        <ul class="telemetry" id="telemetry" aria-live="polite"></ul>
+      </section>
+
+      <section class="panel" aria-label="Registered tools">
+        <h2>Tools</h2>
+        <p class="panel__hint">JIT tools Elias has written for himself.</p>
+        <ul class="tools" id="tool-list">
+          <li class="tool tool--empty">No tools yet — ask Elias to build one.</li>
+        </ul>
+      </section>
+    </aside>
+
+    <script type="module" src="../src/main.js"></script>
+  </body>
+</html>

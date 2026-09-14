@@ -1,0 +1,50 @@
+{
+  "packageId": "ai.eliasthorne.assistant",
+  "host": "elias-thorne.example",
+  "name": "Elias Thorne",
+  "launcherName": "Elias",
+  "display": "standalone",
+  "orientation": "portrait",
+  "themeColor": "#0b0d14",
+  "themeColorDark": "#0b0d14",
+  "navigationColor": "#0b0d14",
+  "navigationColorDark": "#0b0d14",
+  "navigationDividerColor": "#262c40",
+  "navigationDividerColorDark": "#262c40",
+  "backgroundColor": "#0b0d14",
+  "enableNotifications": false,
+  "startUrl": "/",
+  "iconUrl": "https://elias-thorne.example/icons/icon-512.png",
+  "maskableIconUrl": "https://elias-thorne.example/icons/icon-maskable-512.png",
+  "monochromeIconUrl": "",
+  "splashScreenFadeOutDuration": 300,
+  "signingKey": {
+    "path": "./android.keystore",
+    "alias": "elias"
+  },
+  "appVersionName": "0.1.0",
+  "appVersionCode": 1,
+  "shortcuts": [
+    {
+      "name": "Talk to Elias",
+      "short_name": "Talk",
+      "url": "/?arm=1",
+      "chosenIconUrl": "https://elias-thorne.example/icons/icon-192.png"
+    }
+  ],
+  "generatorApp": "bubblewrap-cli",
+  "webManifestUrl": "https://elias-thorne.example/manifest.json",
+  "fallbackType": "customtabs",
+  "features": {},
+  "alphaDependencies": {
+    "enabled": false
+  },
+  "enableSiteSettingsShortcut": true,
+  "isChromeOSOnly": false,
+  "isMetaQuest": false,
+  "fullScopeUrl": "https://elias-thorne.example/",
+  "minSdkVersion": 24,
+  "additionalTrustedOrigins": [],
+  "retainedBundles": [],
+  "appVersion": "0.1.0"
+}
