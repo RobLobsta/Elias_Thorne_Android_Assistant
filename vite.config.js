@@ -1,4 +1,4 @@
-import { copyFile, cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { appendFile, copyFile, cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -100,18 +100,51 @@ function copyStaticAssets() {
       // and directories beginning with an underscore.
       await writeFile(resolve(outDir, '.nojekyll'), '');
 
-      const models = resolve(outDir, 'models');
-      if (existsSync(models)) {
-        const weights = (await readdir(models)).filter((f) => f.endsWith('.onnx'));
-        if (weights.length === 0) {
-          this.warn(
-            'No .onnx weights in public/models — Elias will boot on the fallback ' +
-              'reasoner. See public/models/README.md.',
-          );
-        }
-      }
+      await reportWeightProvisioning.call(this);
     },
   };
+}
+
+/**
+ * Say, at build time, how the app that is being shipped will get its weights.
+ *
+ * A gigabyte-class export is never part of the bundle, so "no .onnx in dist" is
+ * the normal case rather than a fault — but an app with no weights *and* no
+ * configured source for them can only ever run the fallback reasoner, and that
+ * is worth saying out loud rather than discovering on a handset. Reported to
+ * the step summary too, because a Rollup warning scrolls past unread in CI.
+ */
+async function reportWeightProvisioning() {
+  const models = resolve(outDir, 'models');
+  const built = existsSync(models)
+    ? (await readdir(models)).filter((file) => file.endsWith('.onnx'))
+    : [];
+
+  let config = {};
+  try {
+    config = JSON.parse(await readFile(resolve(models, 'model-config.json'), 'utf8'));
+  } catch {
+    // Left as {}: the worker falls back to its own defaults, and the "no
+    // source configured" branch below is then the honest report.
+  }
+
+  let line;
+  if (built.length > 0) {
+    line = `Weights: bundled (${built.join(', ')}).`;
+    this.info?.(line);
+  } else if (config.weightsUrl) {
+    line = `Weights: downloaded on demand from ${config.weightsUrl}.`;
+    this.info?.(line);
+  } else {
+    line =
+      'Weights: none. Elias will boot on the fallback reasoner — put an export ' +
+      'in public/models, or set weightsUrl in public/models/model-config.json. ' +
+      'See public/models/README.md.';
+    this.warn(line);
+  }
+
+  const summary = process.env.GITHUB_STEP_SUMMARY;
+  if (summary) await appendFile(summary, `\n${line}\n`);
 }
 
 async function restoreStableUrls() {

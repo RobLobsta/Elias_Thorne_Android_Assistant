@@ -1,5 +1,10 @@
 {
   "modelFile": "bitnet-2b4t.onnx",
+  "weightsUrl": "",
+  "weightsDataFile": "",
+  "weightsDataUrl": "",
+  "tokenizerUrl": "",
+  "weightsSizeBytes": 0,
   "numHiddenLayers": 30,
   "numKeyValueHeads": 5,
   "headDim": 128,

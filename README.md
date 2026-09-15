@@ -18,16 +18,32 @@ section references below point back at it.
 | Self-improvement loop with pre-commit telemetry (§2.3) | working |
 | PWA shell, offline caching, TWA config (§3) | working |
 | Installable APK from GitHub Actions | working |
-| BitNet inference on WebGPU (§2.2) | needs weights — see below |
+| BitNet inference on WebGPU (§2.2) | working — needs weights, see below |
 
-The ONNX graph runner, tokenizer and sampler are implemented but cannot be
-exercised without a BitNet export, which is too large to commit. With no weights
-present Elias boots on a **fallback reasoner**: a deterministic, non-neural
-responder that emits the same action schema the real model does, so the wake
-word, telemetry, linter, sandbox and memory are all genuinely exercised end to
-end. The backend pill in the UI reads `fallback reasoner` when this is the case.
+A 2B parameter export is a gigabyte-class file. It cannot be committed, it
+cannot be served from a project Pages site (1 GB per site, 100 MB per file), and
+the APK is a Trusted Web Activity that carries no web assets at all — so the
+weights are never part of the build. There are two ways to supply them and one
+fallback:
 
-See [`public/models/README.md`](public/models/README.md) for what to drop in and
+1. **Build them in.** Drop the export into `public/models` before
+   `npm run build`. Needs a deployment that can serve a file that size.
+2. **Download them on demand.** Set `weightsUrl` in
+   `public/models/model-config.json` to an export on a CORS-enabled host, and
+   Elias offers the download from a banner in the UI. Nothing is fetched until
+   the user presses the button — a phone on mobile data must not lose a gigabyte
+   to an app starting up — and the bytes are kept in Cache Storage afterwards,
+   so it is a one-time cost that survives app updates.
+3. **Neither.** Elias boots on a **fallback reasoner**: a deterministic,
+   non-neural responder that emits the same action schema the real model does,
+   so the wake word, telemetry, linter, sandbox and memory are all genuinely
+   exercised end to end. The backend pill reads `fallback reasoner` and the
+   banner says why.
+
+Local files win over the remote source, and the build prints which of the three
+you are shipping.
+
+See [`public/models/README.md`](public/models/README.md) for the config keys and
 how to make `model-config.json` match your export.
 
 ## Quick start
@@ -55,7 +71,7 @@ public/
   manifest.json                PWA descriptors
   sw.js                        offline shell + weight caching
   icons/                       generated PWA/launcher icons
-  models/                      BitNet weights + tokenizer (gitignored)
+  models/                      model-config.json; weights + tokenizer if bundled (gitignored)
   ort/                         staged ONNX Runtime binaries (gitignored)
 src/
   main.js                      UI orchestrator, audio state machine, TTS
@@ -69,6 +85,7 @@ src/
     persona.js                 identity lock, wake anchors, system persona
     schema.js                  action schema, message contracts, allow-lists
     tokenizer.js               byte-level BPE + chat templating
+    weights.js                 where the weights live, and fetching them
 scripts/
   check.mjs                    logic checks (npm test)
   generate-icons.mjs           icon generation (npm run icons)
@@ -281,8 +298,9 @@ inference path — is unaffected, but the ONNX WASM fallback loses
 
 ## Verifying
 
-`npm test` runs 22 dependency-free checks over the wake anchors, the
-interruption gate, the persona identity lock and the action schema.
+`npm test` runs 30 dependency-free checks over the wake anchors, the
+interruption gate, the persona identity lock, the action schema and the
+resolution of weight sources.
 
 Worker-level behaviour was verified by driving the built app in Chromium. If you
 want to reproduce it, install `playwright` and script these against
@@ -293,6 +311,15 @@ want to reproduce it, install `playwright` and script these against
   a sandbox log from inside the tool, and the answer "That comes to 47 across 3
   values."
 - **Persistence.** Reload. The tool and the memories survive.
+- **Weight provisioning.** Verified in Chromium against a purpose-built tiny
+  decoder ONNX graph (`input_ids` + `attention_mask` + `position_ids`, two KV
+  layers, a `logits` head) served from a second origin. All four cases: weights
+  bundled in `public/models`; a remote `weightsUrl` offered, downloaded with
+  progress, compiled, and still cached after a reload; the same with external
+  weight data in a sidecar file; and neither, falling back with the banner
+  explaining why. Plus the failure paths — a corrupt graph and a missing sidecar
+  both surface a readable message, keep Elias on the fallback reasoner, and
+  evict the bad cache entry so Retry starts clean.
 - **Sandbox.** Bind a `MessageChannel` to `sandbox.worker.js` directly and check
   that lint rejects `globalThis` and bare `fetch` and reports syntax errors;
   that a failing spec fails the run; that `ctx.fetch` to a non-allow-listed host
@@ -319,7 +346,9 @@ the same commands, but the first Actions run is still the first Actions run.
 
 - **Weights.** See Status. The graph runner adapts to the common
   `past_key_values.N.key` / `present.N.key` conventions and to optional
-  `attention_mask` / `position_ids`, but no specific export has been run.
+  `attention_mask` / `position_ids`, and has been run against a synthetic graph
+  using them — but no real BitNet export has been through it, and there is no
+  canonical BitNet ONNX export to point `weightsUrl` at, so it ships empty.
 - **Wake word cost.** Continuous `SpeechRecognition` on Android is
   network-backed and battery-hungry, and the platform ends sessions on its own
   schedule (there is a restart supervisor with backoff). A real always-on wake

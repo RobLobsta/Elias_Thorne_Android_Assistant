@@ -66,6 +66,7 @@ const app = {
   backend: 'starting',
   muted: false,
   synthesisFailed: false,
+  weights: { installing: false },
 };
 
 /* ------------------------------------------------------------------- boot */
@@ -87,6 +88,10 @@ function cacheDom() {
     'mute-button',
     'stop-button',
     'permission-notice',
+    'weights-notice',
+    'weights-message',
+    'weights-progress',
+    'weights-button',
   ];
   for (const id of ids) dom[camel(id)] = document.getElementById(id);
 }
@@ -137,6 +142,14 @@ function bindControls() {
   });
 
   dom.stopButton.addEventListener('click', () => interrupt('button'));
+
+  dom.weightsButton.addEventListener('click', () => {
+    if (app.weights.installing) {
+      app.inference.postMessage({ type: MESSAGE.WEIGHTS_CANCEL });
+      return;
+    }
+    app.inference.postMessage({ type: MESSAGE.WEIGHTS_INSTALL });
+  });
 
   dom.composer.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -266,6 +279,11 @@ function onStatus(message) {
     return;
   }
 
+  if (stage === 'weights' && detail && typeof detail === 'object') {
+    renderWeightsNotice(detail);
+    return;
+  }
+
   if (stage === 'ready' && message.degraded) {
     pushTelemetry(`Weights unavailable — ${message.reason}`, 'error');
     return;
@@ -282,6 +300,84 @@ function onStatus(message) {
   }
 
   if (typeof detail === 'string') dom.stateDetail.textContent = detail;
+}
+
+/**
+ * The weights banner.
+ *
+ * Elias is usable the moment he boots, on the fallback reasoner, so this is an
+ * offer rather than an error. It states the cost up front — a 2B export is a
+ * gigabyte-class download and the handset may be on mobile data — and nothing
+ * is fetched until the button is pressed.
+ */
+function renderWeightsNotice(detail) {
+  const { kind, bytes, received, total, installed, failed } = detail;
+  app.weights.installing = Boolean(detail.installing);
+
+  const show = (message, { action = null, progress = null } = {}) => {
+    dom.weightsMessage.textContent = message;
+    dom.weightsNotice.hidden = false;
+    dom.weightsButton.hidden = action === null;
+    if (action) dom.weightsButton.textContent = action;
+    dom.weightsProgress.hidden = progress === null;
+    if (progress !== null) dom.weightsProgress.value = progress;
+  };
+
+  if (installed) {
+    hideWeightsNotice();
+    return;
+  }
+
+  if (app.weights.installing) {
+    const done = received ?? 0;
+    const size = total || bytes || 0;
+    show(
+      size
+        ? `Downloading weights — ${formatBytes(done)} of ${formatBytes(size)}.`
+        : `Downloading weights — ${formatBytes(done)} so far.`,
+      { action: 'Cancel', progress: size ? Math.min(done / size, 1) : 0 },
+    );
+    return;
+  }
+
+  if (failed) {
+    show(
+      failed === 'cancelled'
+        ? 'Weights download cancelled. Elias is still on the fallback reasoner.'
+        : `Weights download failed — ${failed}`,
+      { action: 'Retry' },
+    );
+    return;
+  }
+
+  if (kind === 'downloadable') {
+    show(
+      bytes
+        ? `Elias is on the fallback reasoner. Installing his BitNet weights is a ${formatBytes(bytes)} download, kept on the device afterwards.`
+        : 'Elias is on the fallback reasoner. His BitNet weights can be downloaded and kept on the device.',
+      { action: 'Install weights' },
+    );
+    return;
+  }
+
+  if (kind === 'absent') {
+    // Nothing the user can do from here — this is a build-time configuration
+    // gap, so say so once and get out of the way.
+    show(
+      'Elias is on the fallback reasoner: no weights were built in and model-config.json names no source for them. See public/models/README.md.',
+    );
+    return;
+  }
+
+  hideWeightsNotice();
+}
+
+/** Hidden and blank, so a later re-show never flashes the last run's text. */
+function hideWeightsNotice() {
+  dom.weightsNotice.hidden = true;
+  dom.weightsMessage.textContent = '';
+  dom.weightsProgress.hidden = true;
+  dom.weightsProgress.value = 0;
 }
 
 function backendLabel(backend) {

@@ -35,6 +35,16 @@
 
     <p class="notice" id="permission-notice" hidden></p>
 
+    <section class="notice notice--weights" id="weights-notice" aria-live="polite" hidden>
+      <p class="notice__text" id="weights-message"></p>
+      <progress class="notice__progress" id="weights-progress" max="1" value="0" hidden></progress>
+      <div class="notice__actions">
+        <button type="button" id="weights-button" class="control control--primary">
+          Install weights
+        </button>
+      </div>
+    </section>
+
     <main class="stage">
       <section class="orb" aria-label="Audio state visualiser">
         <canvas id="visualizer" aria-hidden="true"></canvas>

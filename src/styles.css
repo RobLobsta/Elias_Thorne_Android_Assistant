@@ -133,6 +133,53 @@ body {
   font-size: 0.8rem;
 }
 
+/*
+ * The weights banner. Not an error — the agent is running, just on the fallback
+ * reasoner — so it carries the accent rather than the warning colour, and it is
+ * the one place in the UI that can start a gigabyte-sized download.
+ */
+.notice--weights {
+  display: grid;
+  gap: 8px;
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+  background: color-mix(in srgb, var(--accent) 8%, var(--raised));
+  color: var(--text);
+}
+
+.notice__text {
+  margin: 0;
+}
+
+.notice__progress {
+  width: 100%;
+  height: 4px;
+  appearance: none;
+  border: none;
+  border-radius: 2px;
+  background: var(--raised-soft);
+}
+
+.notice__progress::-webkit-progress-bar {
+  border-radius: 2px;
+  background: var(--raised-soft);
+}
+
+.notice__progress::-webkit-progress-value {
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.notice__progress::-moz-progress-bar {
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.notice__actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
 /* ---------------------------------------------------------------- stage */
 
 .stage {
@@ -427,17 +474,20 @@ body {
     display: grid;
     height: 100%;
     overflow: hidden;
-    grid-template-rows: auto auto minmax(0, 1fr);
+    grid-template-rows: auto auto auto minmax(0, 1fr);
     grid-template-columns: minmax(0, 1fr) 320px;
     grid-template-areas:
       'masthead masthead'
       'notice   notice'
+      'weights  weights'
       'stage    sidecar';
     padding-inline: 20px;
   }
 
   .masthead { grid-area: masthead; }
   .notice { grid-area: notice; }
+  /* Its own row: two banners sharing one area would sit on top of each other. */
+  .notice--weights { grid-area: weights; }
   .stage { grid-area: stage; }
 
   .sidecar {
