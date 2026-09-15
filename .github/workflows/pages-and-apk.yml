@@ -1,0 +1,334 @@
+# Publishes the PWA to GitHub Pages and builds an installable APK from it.
+#
+# A Trusted Web Activity is a Chrome tab in an app shell: the APK contains no
+# web assets, only the URL to open. So the site has to be published first, and
+# the APK is built from android/twa-manifest.json, which points at that URL.
+#
+# One-time setup: Settings -> Pages -> Source -> "GitHub Actions".
+#
+# The APK is a workflow artifact, not a release. Download it from the run
+# summary, push it to a device with `adb install -r`, or open the link on the
+# phone and install from Chrome (needs "install unknown apps" for the browser).
+
+name: Pages and APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Pages allows one concurrent deployment. Never cancel one in flight: a
+# half-finished deploy leaves the site broken.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  site:
+    name: Build web bundle
+    runs-on: ubuntu-latest
+    outputs:
+      base-path: ${{ steps.paths.outputs.base }}
+      site-url: ${{ steps.paths.outputs.site }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Derive deployment paths
+        id: paths
+        run: |
+          # A project Pages site is served from /<repo>/, and the host is the
+          # owner name lower-cased. Deriving both means a rename cannot leave a
+          # stale hard-coded path behind.
+          repo='${{ github.event.repository.name }}'
+          owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          echo "base=/$repo/" >> "$GITHUB_OUTPUT"
+          echo "host=$owner.github.io" >> "$GITHUB_OUTPUT"
+          echo "site=https://$owner.github.io/$repo/" >> "$GITHUB_OUTPUT"
+
+      - run: npm ci
+
+      - name: Check wake anchors, interrupt gate and action schema
+        run: npm test
+
+      - name: Build
+        env:
+          BASE_PATH: ${{ steps.paths.outputs.base }}
+        run: npm run build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      # The APK job reuses this rather than rebuilding, so the icons baked into
+      # the APK are the exact ones that were published.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: dist
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Pages
+    needs: site
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  apk:
+    name: Build APK
+    needs: site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: dist
+
+      # Bubblewrap downloads its own JDK 17 and Android SDK (~1.2 GB) on first
+      # use. Caching turns a five-minute provision into a few seconds.
+      - name: Cache Bubblewrap toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bubblewrap
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: bubblewrap-${{ runner.os }}-${{ hashFiles('android/twa-manifest.json') }}
+          restore-keys: |
+            bubblewrap-${{ runner.os }}-
+
+      - name: Install Bubblewrap
+        run: npm install -g @bubblewrap/cli@1.25.0
+
+      - name: Provision JDK and Android SDK
+        run: |
+          # First run asks whether to download the JDK and the Android SDK.
+          # `yes` accepts both; afterwards ~/.bubblewrap/config.json records the
+          # paths and every later command is non-interactive.
+          if [ ! -f "$HOME/.bubblewrap/config.json" ]; then
+            yes | bubblewrap --version || true
+          fi
+          cat "$HOME/.bubblewrap/config.json"
+
+      - name: Accept Android SDK licences
+        run: |
+          # Without this, Gradle skips build-tools and then dies at
+          # :app:minifyReleaseWithR8 with "licences have not been accepted".
+          # Bubblewrap's bundled SDK uses the legacy tools/bin layout rather
+          # than cmdline-tools/latest, so locate the binary instead of
+          # assuming either.
+          SDK=$(node -p "require('$HOME/.bubblewrap/config.json').androidSdkPath")
+          SDKMANAGER=$(find "$SDK" -name sdkmanager -type f | head -1)
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found under $SDK" >&2
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
+          ls "$SDK/licenses"
+
+      - name: Serve the built site for asset extraction
+        env:
+          BASE_PATH: ${{ needs.site.outputs.base-path }}
+        run: |
+          # Bubblewrap fetches the web manifest and the icons over HTTP while
+          # generating the project. Pointing it at the freshly built bundle
+          # rather than the live site removes the race on the very first run,
+          # when Pages has never been published.
+          #
+          # Mounted under the real base path, not at the server root: the built
+          # manifest's start_url and scope are absolute, so serving it anywhere
+          # else makes them resolve to URLs that 404.
+          mkdir -p "serve$BASE_PATH"
+          cp -r dist/. "serve$BASE_PATH"
+          nohup python3 -m http.server 4173 --directory serve --bind 127.0.0.1 \
+            > /tmp/http.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf -o /dev/null "http://127.0.0.1:4173${BASE_PATH}manifest.json" && break
+            sleep 1
+          done
+          curl -sf "http://127.0.0.1:4173${BASE_PATH}manifest.json" | head -c 200
+
+      - name: Generate the Android project
+        env:
+          SITE_HOST: ${{ needs.site.outputs.site-url }}
+          BASE_PATH: ${{ needs.site.outputs.base-path }}
+        run: |
+          mkdir -p build/twa
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const manifest = JSON.parse(fs.readFileSync('android/twa-manifest.json', 'utf8'));
+          const site = new URL(process.env.SITE_HOST);
+          const local = `http://127.0.0.1:4173${process.env.BASE_PATH}`;
+
+          // What the installed app opens.
+          manifest.host = site.hostname;
+          manifest.startUrl = process.env.BASE_PATH;
+          manifest.fullScopeUrl = site.toString();
+
+          // Where the generator reads metadata and icons from right now.
+          manifest.webManifestUrl = local + 'manifest.json';
+          manifest.iconUrl = local + 'icons/icon-512.png';
+          manifest.maskableIconUrl = local + 'icons/icon-maskable-512.png';
+          manifest.shortcuts = [];
+          manifest.signingKey = { path: './android.keystore', alias: 'elias' };
+
+          fs.writeFileSync('build/twa/twa-manifest.json', JSON.stringify(manifest, null, 2));
+          console.log('opens:', `https://${manifest.host}${manifest.startUrl}`);
+          NODE
+
+          cd build/twa
+          bubblewrap update --skipVersionUpgrade < /dev/null
+
+      - name: Add the microphone permission
+        run: |
+          # Bubblewrap does not add RECORD_AUDIO, and without it getUserMedia
+          # fails inside the TWA with no visible error — the wake word simply
+          # never triggers.
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const path = 'build/twa/app/src/main/AndroidManifest.xml';
+          let xml = fs.readFileSync(path, 'utf8');
+          if (xml.includes('RECORD_AUDIO')) {
+            console.log('already present');
+          } else {
+            xml = xml.replace(
+              /(<manifest\b[^>]*>\n)/,
+              '$1    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n' +
+                '    <uses-feature android:name="android.hardware.microphone" android:required="true" />\n',
+            );
+            fs.writeFileSync(path, xml);
+            console.log('added RECORD_AUDIO');
+          }
+          NODE
+          grep -n 'RECORD_AUDIO\|hardware.microphone' build/twa/app/src/main/AndroidManifest.xml
+
+      - name: Prepare the signing key
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          cd build/twa
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            # A stable key means the device can upgrade the app in place.
+            echo "$KEYSTORE_BASE64" | base64 -d > android.keystore
+            echo "store=$KEYSTORE_PASSWORD" >> "$GITHUB_OUTPUT"
+            echo "key=$KEY_PASSWORD" >> "$GITHUB_OUTPUT"
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+          else
+            # No secret configured: throwaway key. Android refuses to upgrade an
+            # app whose signature changed, so uninstall before each install.
+            JDK=$(node -p "require('$HOME/.bubblewrap/config.json').jdkPath")
+            "$JDK/bin/keytool" -genkeypair -v \
+              -keystore android.keystore -alias elias \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=Elias Thorne Test, OU=Dev, O=Test, L=NA, S=NA, C=NA"
+            echo "store=android" >> "$GITHUB_OUTPUT"
+            echo "key=android" >> "$GITHUB_OUTPUT"
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the APK
+        env:
+          BUBBLEWRAP_KEYSTORE_PASSWORD: ${{ steps.signing.outputs.store }}
+          BUBBLEWRAP_KEY_PASSWORD: ${{ steps.signing.outputs.key }}
+        run: |
+          cd build/twa
+          # `yes` covers any residual SDK component licence prompt; the
+          # passwords come from the environment, so nothing else is asked.
+          yes | bubblewrap build --skipPwaValidation
+          ls -la ./*.apk ./*.aab 2>/dev/null || true
+
+      - name: Emit the Digital Asset Links file
+        run: |
+          cd build/twa
+          # assetlinks.json is what removes the browser URL bar. It must be
+          # served from the DOMAIN ROOT, which a project Pages site cannot do —
+          # see the README. Emitted anyway so it is ready if the app ever moves
+          # to a root domain.
+          #
+          # Built from the APK's real signature rather than
+          # `bubblewrap fingerprint generateAssetLinks`, which reads a registry
+          # in twa-manifest.json that is empty here and yields a bare `[]`.
+          SDK=$(node -p "require('$HOME/.bubblewrap/config.json').androidSdkPath")
+          APKSIGNER=$(find "$SDK" -name apksigner -type f | head -1)
+          JAVA_HOME=$(node -p "require('$HOME/.bubblewrap/config.json').jdkPath")
+          export JAVA_HOME
+          "$APKSIGNER" verify --print-certs app-release-signed.apk > certs.txt
+
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const certs = fs.readFileSync('certs.txt', 'utf8');
+          const manifest = JSON.parse(fs.readFileSync('twa-manifest.json', 'utf8'));
+          const match = /SHA-256 digest:\s*([0-9a-f]+)/i.exec(certs);
+          if (!match) throw new Error('no SHA-256 digest in apksigner output');
+          // Digital Asset Links wants colon-separated uppercase hex.
+          const fingerprint = match[1].toUpperCase().match(/../g).join(':');
+          fs.writeFileSync('assetlinks.json', JSON.stringify([{
+            relation: ['delegate_permission/common.handle_all_urls'],
+            target: {
+              namespace: 'android_app',
+              package_name: manifest.packageId,
+              sha256_cert_fingerprints: [fingerprint],
+            },
+          }], null, 2) + '\n');
+          console.log('package    :', manifest.packageId);
+          console.log('fingerprint:', fingerprint);
+          NODE
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elias-thorne-apk
+          path: |
+            build/twa/*.apk
+            build/twa/assetlinks.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summary
+        env:
+          SITE: ${{ needs.site.outputs.site-url }}
+          STABLE: ${{ steps.signing.outputs.stable }}
+        run: |
+          {
+            echo "### APK ready"
+            echo
+            echo "Opens: \`$SITE\`"
+            echo
+            echo 'Download **elias-thorne-apk** from this run, then:'
+            echo
+            echo '```'
+            echo 'adb install -r app-release-signed.apk'
+            echo '```'
+            if [ "$STABLE" != "true" ]; then
+              echo
+              echo '> Signed with a throwaway key generated for this run, so the'
+              echo '> signature changes every build. Run `adb uninstall'
+              echo '> ai.eliasthorne.assistant` first if the install is rejected.'
+              echo '> Add an `ANDROID_KEYSTORE_BASE64` secret for a stable key.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

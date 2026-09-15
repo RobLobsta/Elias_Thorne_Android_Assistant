@@ -1,0 +1,27 @@
+node_modules/
+dist/
+.vite/
+
+# BitNet 2B4T weights are cache-managed at runtime and never committed.
+public/models/*.onnx
+public/models/*.onnx_data
+public/models/*.onnx.data
+public/models/*.bin
+public/models/*.safetensors
+
+# Bubblewrap / Android build output and signing material
+android/app/
+android/build/
+android/.gradle/
+android/gradle*
+android/*.keystore
+android/*.jks
+android/*.apk
+android/*.aab
+android/assetlinks.json
+
+*.log
+.DS_Store
+
+# ONNX Runtime WASM binaries, staged from node_modules at build time.
+public/ort/

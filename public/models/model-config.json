@@ -1,0 +1,20 @@
+{
+  "modelFile": "bitnet-2b4t.onnx",
+  "numHiddenLayers": 30,
+  "numKeyValueHeads": 5,
+  "headDim": 128,
+  "maxContextTokens": 2048,
+  "maxNewTokens": 320,
+  "temperature": 0.7,
+  "topP": 0.9,
+  "topK": 40,
+  "repetitionPenalty": 1.1,
+  "template": {
+    "bos": "<|begin_of_text|>",
+    "system": "<|start_header_id|>system<|end_header_id|>\n\n{content}<|eot_id|>",
+    "user": "<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>",
+    "assistant": "<|start_header_id|>assistant<|end_header_id|>\n\n{content}<|eot_id|>",
+    "generationPrefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+    "stopTokens": ["<|eot_id|>", "<|end_of_text|>"]
+  }
+}

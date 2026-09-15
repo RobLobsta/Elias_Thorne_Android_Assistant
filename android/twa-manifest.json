@@ -1,0 +1,50 @@
+{
+  "packageId": "ai.eliasthorne.assistant",
+  "host": "roblobsta.github.io",
+  "name": "Elias Thorne",
+  "launcherName": "Elias",
+  "display": "standalone",
+  "orientation": "portrait",
+  "themeColor": "#0b0d14",
+  "themeColorDark": "#0b0d14",
+  "navigationColor": "#0b0d14",
+  "navigationColorDark": "#0b0d14",
+  "navigationDividerColor": "#262c40",
+  "navigationDividerColorDark": "#262c40",
+  "backgroundColor": "#0b0d14",
+  "enableNotifications": false,
+  "startUrl": "/Elias_Thorne_Android_Assistant/",
+  "iconUrl": "https://roblobsta.github.io/Elias_Thorne_Android_Assistant/icons/icon-512.png",
+  "maskableIconUrl": "https://roblobsta.github.io/Elias_Thorne_Android_Assistant/icons/icon-maskable-512.png",
+  "monochromeIconUrl": "",
+  "splashScreenFadeOutDuration": 300,
+  "signingKey": {
+    "path": "./android.keystore",
+    "alias": "elias"
+  },
+  "appVersionName": "0.1.0",
+  "appVersionCode": 1,
+  "shortcuts": [
+    {
+      "name": "Talk to Elias",
+      "short_name": "Talk",
+      "url": "/Elias_Thorne_Android_Assistant/?arm=1",
+      "chosenIconUrl": "https://roblobsta.github.io/Elias_Thorne_Android_Assistant/icons/icon-192.png"
+    }
+  ],
+  "generatorApp": "bubblewrap-cli",
+  "webManifestUrl": "https://roblobsta.github.io/Elias_Thorne_Android_Assistant/manifest.json",
+  "fallbackType": "customtabs",
+  "features": {},
+  "alphaDependencies": {
+    "enabled": false
+  },
+  "enableSiteSettingsShortcut": true,
+  "isChromeOSOnly": false,
+  "isMetaQuest": false,
+  "fullScopeUrl": "https://roblobsta.github.io/Elias_Thorne_Android_Assistant/",
+  "minSdkVersion": 24,
+  "additionalTrustedOrigins": [],
+  "retainedBundles": [],
+  "appVersion": "0.1.0"
+}
