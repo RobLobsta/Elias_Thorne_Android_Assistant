@@ -434,6 +434,10 @@ class BitNetEngine {
   #wantsAttentionMask = false;
   #wantsPositionIds = false;
   #stopIds = new Set();
+  /** KV cache dtype and per-head shape, read off the graph in #introspect. */
+  #cacheType = null;
+  #cacheHeads = null;
+  #cacheHeadDim = null;
 
   constructor({ session, tokenizer, config, backend }) {
     this.#session = session;
@@ -506,6 +510,17 @@ class BitNetEngine {
     this.#wantsAttentionMask = inputs.includes('attention_mask');
     this.#wantsPositionIds = inputs.includes('position_ids');
 
+    // The graph declares the cache's dtype and per-head shape; the config's
+    // numKeyValueHeads / headDim are only a fallback for an export that leaves
+    // them symbolic. Trusting the config over the graph is how a float16 export
+    // — which is what almost every browser-targeted quantisation is — gets fed
+    // a float32 cache and dies on a type mismatch at the first run.
+    const metadata = new Map(
+      (this.#session.inputMetadata ?? [])
+        .filter((entry) => entry.isTensor)
+        .map((entry) => [entry.name, entry]),
+    );
+
     const pastPattern = /^past_key_values\.(\d+)\.(key|value)$/;
     const layers = new Map();
     for (const name of inputs) {
@@ -515,6 +530,14 @@ class BitNetEngine {
       const entry = layers.get(index) ?? {};
       entry[match[2]] = name;
       layers.set(index, entry);
+
+      const meta = metadata.get(name);
+      if (!meta) continue;
+      this.#cacheType ??= meta.type;
+      // [batch, kvHeads, pastSequence, headDim] — take whichever of the two
+      // head dimensions the exporter pinned to a number.
+      if (typeof meta.shape?.[1] === 'number') this.#cacheHeads ??= meta.shape[1];
+      if (typeof meta.shape?.[3] === 'number') this.#cacheHeadDim ??= meta.shape[3];
     }
 
     for (const [index, entry] of [...layers.entries()].sort((a, b) => a[0] - b[0])) {
@@ -594,11 +617,12 @@ class BitNetEngine {
   }
 
   #emptyCache(ort) {
-    const { numKeyValueHeads, headDim } = this.#config;
+    const type = this.#cacheType ?? 'float32';
+    const heads = this.#cacheHeads ?? this.#config.numKeyValueHeads;
+    const headDim = this.#cacheHeadDim ?? this.#config.headDim;
     const cache = {};
     for (const layer of this.#kvLayers) {
-      const empty = () =>
-        new ort.Tensor('float32', new Float32Array(0), [1, numKeyValueHeads, 0, headDim]);
+      const empty = () => new ort.Tensor(type, emptyTensorData(type), [1, heads, 0, headDim]);
       cache[layer.pastKey] = empty();
       cache[layer.pastValue] = empty();
     }
@@ -648,13 +672,58 @@ class BitNetEngine {
     const data = tensor.data;
     const offset = (sequence - 1) * vocab;
     const slice = new Float32Array(vocab);
-    for (let i = 0; i < vocab; i += 1) slice[i] = Number(data[offset + i]);
+    // A float16 output arrives as raw bit patterns in a Uint16Array on any
+    // engine without Float16Array, where Number() would read the bits as an
+    // integer and the sampler would pick nonsense.
+    const packed = tensor.type === 'float16' && data instanceof Uint16Array;
+    for (let i = 0; i < vocab; i += 1) {
+      const value = data[offset + i];
+      slice[i] = packed ? float16ToNumber(value) : Number(value);
+    }
     return slice;
   }
 
   async dispose() {
     await this.#session.release?.();
   }
+}
+
+/**
+ * A zero-length backing array of the right kind for an ONNX dtype.
+ *
+ * ONNX Runtime checks the array kind against the declared type even when the
+ * tensor holds nothing, so the empty KV cache fed on the first step still has
+ * to be built out of the right one.
+ */
+function emptyTensorData(type) {
+  switch (type) {
+    case 'float16':
+      // No universal typed array for half floats: ORT takes Float16Array where
+      // the engine has it and a Uint16Array of raw bits everywhere else.
+      return typeof Float16Array === 'function' ? new Float16Array(0) : new Uint16Array(0);
+    case 'float64':
+      return new Float64Array(0);
+    case 'int64':
+      return new BigInt64Array(0);
+    case 'int32':
+      return new Int32Array(0);
+    case 'int8':
+      return new Int8Array(0);
+    case 'uint8':
+      return new Uint8Array(0);
+    default:
+      return new Float32Array(0);
+  }
+}
+
+/** Decode an IEEE-754 half-precision bit pattern. */
+function float16ToNumber(bits) {
+  const sign = bits & 0x8000 ? -1 : 1;
+  const exponent = (bits >> 10) & 0x1f;
+  const fraction = bits & 0x03ff;
+  if (exponent === 0) return sign * fraction * 2 ** -24;
+  if (exponent === 0x1f) return fraction ? NaN : sign * Infinity;
+  return sign * (fraction + 1024) * 2 ** (exponent - 25);
 }
 
 /** Temperature / top-k / top-p sampling with a repetition penalty. */

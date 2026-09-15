@@ -68,10 +68,14 @@ The build says which of the three you are shipping, and warns only for this one.
 ## Making `model-config.json` match your export
 
 `numHiddenLayers`, `numKeyValueHeads` and `headDim` size the empty KV cache fed
-to the graph on the first forward pass. They must match the exported model or
-the first `session.run` fails with a shape mismatch. The committed values follow
-the published BitNet b1.58-2B-4T configuration (30 layers, 5 KV heads, 128 head
-dim); read them off your own `config.json` if you exported something else.
+to the graph on the first forward pass. They are only a fallback: the worker
+reads the cache's dtype and per-head shape off the graph's own input metadata
+and uses that when the exporter pinned them to numbers, which it almost always
+does. That matters because most browser-targeted quantisations (`q4f16`,
+`fp16`) declare a **float16** cache, and feeding a float32 one fails at the
+first `session.run`. Set these to match your export anyway, for the exports that
+leave every dimension symbolic. The committed values follow the published
+BitNet b1.58-2B-4T configuration (30 layers, 5 KV heads, 128 head dim).
 
 The `template` block renders the chat prompt. Replace the four slot strings if
 your export was trained with different turn markers — the tokenizer resolves
@@ -85,7 +89,11 @@ naming, and supports:
 - `input_ids` (int64, required), plus optional `attention_mask` and `position_ids`
 - KV cache inputs named `past_key_values.<n>.key` / `.value`
 - matching outputs named `present.<n>.key` / `.value`, or `present_key_values.<n>.*`
-- a `logits` output shaped `[batch, sequence, vocab]`
+- a `logits` output shaped `[batch, sequence, vocab]`, float32 or float16
+
+This is what the exports under Hugging Face's `onnx-community` org emit, so one
+of those can be dropped straight into `weightsUrl` — see the note on other
+models in the top-level README.
 
 A graph without a KV cache still runs — the worker falls back to re-feeding the
 whole sequence each step — but expect it to be far slower.

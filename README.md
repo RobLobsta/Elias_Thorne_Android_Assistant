@@ -46,6 +46,47 @@ you are shipping.
 See [`public/models/README.md`](public/models/README.md) for the config keys and
 how to make `model-config.json` match your export.
 
+### It does not have to be BitNet
+
+There is no official BitNet 2B4T ONNX export — Microsoft publishes safetensors
+and GGUF only — so `weightsUrl` ships empty. But the graph runner is not
+BitNet-specific: it introspects whatever decoder-only ONNX you give it. The
+exports under Hugging Face's [`onnx-community`](https://huggingface.co/onnx-community)
+org already match what it expects, and they come in browser-sized
+quantisations.
+
+This was verified end to end with SmolLM2-360M-Instruct (`q4f16`, 261 MB):
+
+```json
+{
+  "modelFile": "model.onnx",
+  "weightsUrl": "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/onnx/model_q4f16.onnx",
+  "tokenizerUrl": "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer.json",
+  "numHiddenLayers": 32,
+  "numKeyValueHeads": 5,
+  "headDim": 64,
+  "template": {
+    "bos": "",
+    "system": "<|im_start|>system\n{content}<|im_end|>\n",
+    "user": "<|im_start|>user\n{content}<|im_end|>\n",
+    "assistant": "<|im_start|>assistant\n{content}<|im_end|>\n",
+    "generationPrefix": "<|im_start|>assistant\n",
+    "stopTokens": ["<|im_end|>", "<|endoftext|>"]
+  }
+}
+```
+
+Note the `template` block: SmolLM2 is ChatML, not Llama-3. Swapping those four
+strings is the whole of what a differently-templated model needs.
+
+**Speed.** That run took ~50 s per reply on four desktop cores, because ONNX
+Runtime fell back to single-threaded WASM. WASM threads need
+`crossOriginIsolated`, which needs COOP/COEP response headers, which GitHub
+Pages cannot set. On a handset the path that matters is WebGPU — which Chrome
+on Android has, and which the engine prefers when present — but that was not
+measurable in this environment, since it has no GPU. Treat the CPU number as a
+floor, not as what a phone will do.
+
 ## Quick start
 
 ```bash
@@ -344,11 +385,13 @@ the same commands, but the first Actions run is still the first Actions run.
 
 ## Known limitations
 
-- **Weights.** See Status. The graph runner adapts to the common
-  `past_key_values.N.key` / `present.N.key` conventions and to optional
-  `attention_mask` / `position_ids`, and has been run against a synthetic graph
-  using them — but no real BitNet export has been through it, and there is no
-  canonical BitNet ONNX export to point `weightsUrl` at, so it ships empty.
+- **Weights.** See Status. The graph runner has now been run against a real
+  instruct model (SmolLM2-360M, `q4f16`) as well as synthetic float32 and
+  float16 graphs. No *BitNet* export has been through it, because none exists in
+  ONNX — so `weightsUrl` ships empty and the headline claim of a ternary model
+  on WebGPU is still unproven. Note also that ONNX Runtime Web has no ternary
+  kernel: an ONNX BitNet would be stored and executed densely, so it would carry
+  the size and the cost of any other 2B model.
 - **Wake word cost.** Continuous `SpeechRecognition` on Android is
   network-backed and battery-hungry, and the platform ends sessions on its own
   schedule (there is a restart supervisor with backoff). A real always-on wake
