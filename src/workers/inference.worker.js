@@ -36,7 +36,7 @@ import { BpeTokenizer, applyChatTemplate, DEFAULT_CHAT_TEMPLATE } from '../utils
 import {
   resolveWeightSources,
   probeLocal,
-  probeCache,
+  probeStored,
   probeRemoteSize,
   download,
   evict,
@@ -1215,7 +1215,7 @@ async function surveyWeights(config) {
     return { kind: WEIGHTS.ABSENT, sources, bytes: 0 };
   }
 
-  const cached = await probeCache(sources.model.remote);
+  const cached = await probeStored(sources.model.remote);
   if (cached.ok) return { kind: WEIGHTS.CACHED, sources, bytes: cached.bytes };
 
   const bytes = (await probeRemoteSize(sources.model.remote)) || config.weightsSizeBytes || 0;
@@ -1233,17 +1233,18 @@ async function acquire(source, { what, allowNetwork, onProgress, signal, expecte
   if ((await probeLocal(source.local)).ok) {
     const response = await fetch(source.local, { signal });
     if (!response.ok) throw new Error(`${what} unreadable (HTTP ${response.status}).`);
-    return new Uint8Array(await response.arrayBuffer());
+    // Served by the app, so the service worker's cache-first rule keeps it;
+    // nothing for this function to persist.
+    return { bytes: new Uint8Array(await response.arrayBuffer()), cached: true };
   }
 
   if (!source.remote) {
     throw new Error(`No ${what} at ${source.local}, and model-config.json names no remote source.`);
   }
-  if (!allowNetwork && !(await probeCache(source.remote)).ok) {
+  if (!allowNetwork && !(await probeStored(source.remote)).ok) {
     throw new Error(`${what} has not been downloaded yet.`);
   }
-  const { bytes } = await download(source.remote, { onProgress, signal, expectedBytes });
-  return bytes;
+  return download(source.remote, { onProgress, signal, expectedBytes });
 }
 
 /**
@@ -1258,26 +1259,38 @@ async function provisionWeights(survey, { allowNetwork = false, onProgress, sign
   const { sources } = survey;
   const shared = { allowNetwork, signal };
 
-  const tokenizerBytes = await acquire(sources.tokenizer, { what: 'tokenizer.json', ...shared });
+  const tokenizer = await acquire(sources.tokenizer, { what: 'tokenizer.json', ...shared });
 
-  const externalData = sources.externalData
-    ? {
-        path: sources.externalData.file,
-        data: await acquire(sources.externalData, { what: 'external weight data', ...shared }),
-      }
+  const external = sources.externalData
+    ? await acquire(sources.externalData, { what: 'external weight data', ...shared })
+    : null;
+  const externalData = external
+    ? { path: sources.externalData.file, data: external.bytes }
     : null;
 
-  const model =
-    survey.kind === WEIGHTS.LOCAL
-      ? sources.model.local
-      : await acquire(sources.model, {
-          what: 'BitNet weights',
-          ...shared,
-          onProgress,
-          expectedBytes: survey.bytes,
-        });
+  if (survey.kind === WEIGHTS.LOCAL) {
+    return {
+      model: sources.model.local,
+      externalData,
+      tokenizerBytes: tokenizer.bytes,
+      persisted: true,
+    };
+  }
 
-  return { model, externalData, tokenizerBytes };
+  const model = await acquire(sources.model, {
+    what: 'BitNet weights',
+    ...shared,
+    onProgress,
+    expectedBytes: survey.bytes,
+  });
+
+  return {
+    model: model.bytes,
+    externalData,
+    tokenizerBytes: tokenizer.bytes,
+    // Every piece has to have stuck for the next boot to skip the network.
+    persisted: model.cached && tokenizer.cached && (external ? external.cached : true),
+  };
 }
 
 /** Tell the UI thread what it may offer the user. */
@@ -1332,10 +1345,21 @@ async function installWeights() {
       onProgress: (detail) => status('boot', detail),
     });
     state.backend = state.engine.backend;
-    state.weights.survey = { ...survey, kind: WEIGHTS.CACHED };
+    // Only claim CACHED if the bytes actually stuck; otherwise the next boot
+    // would look for a cache entry that is not there and offer nothing.
+    state.weights.survey = {
+      ...survey,
+      kind: assets.persisted ? WEIGHTS.CACHED : WEIGHTS.DOWNLOADABLE,
+    };
     state.weights.installing = false;
-    postWeightsStatus({ installed: true });
-    telemetry(`Weights installed — now thinking on ${state.backend}.`, { channel: 'system' });
+    postWeightsStatus({ installed: true, persisted: assets.persisted });
+    telemetry(
+      assets.persisted
+        ? `Weights installed and kept on the device — now thinking on ${state.backend}.`
+        : `Weights loaded on ${state.backend}, but the device refused to store them ` +
+            `(out of quota). They will have to be downloaded again next time.`,
+      { channel: 'system' },
+    );
     post(MESSAGE.STATUS, { stage: 'online', detail: await onlineDetail() });
   } catch (error) {
     state.weights.installing = false;

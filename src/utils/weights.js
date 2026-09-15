@@ -13,7 +13,7 @@
  *   1. `models/<modelFile>` next to the app. Present when someone dropped an
  *      export into `public/models` before building, and the only case where the
  *      service worker's cache-first rule applies on its own.
- *   2. The Cache Storage bucket, keyed by the remote URL. This is what makes
+ *   2. The IndexedDB weights store, keyed by the remote URL. This is what makes
  *      the download a one-time cost — it survives app updates, and with the
  *      persistent storage lock held it survives Android's cache cleanup too.
  *   3. `weightsUrl` from `model-config.json`, over the network.
@@ -22,11 +22,18 @@
  * the inference worker decide what to do with them.
  */
 
+import { STORES, idbGet, idbSet, idbDelete } from './storage.js';
+
 /**
- * Shared with the service worker's cache-first rule. Deliberately unversioned:
- * a download this large must survive app updates.
+ * Where a downloaded file is kept, keyed by its URL.
+ *
+ * IndexedDB rather than Cache Storage — see the note on STORES in
+ * utils/storage.js. In short: Chromium caps a single Cache entry at roughly
+ * 200 MB and fails past it with an opaque error, which is smaller than any
+ * model worth running. The store is not versioned, so a download survives app
+ * updates; the URL is the key, so changing `weightsUrl` fetches afresh.
  */
-export const MODEL_CACHE = 'elias-models';
+const KEY_PREFIX = 'weights:';
 
 /** Progress callbacks fire per chunk; this throttles them to something a UI can use. */
 const PROGRESS_INTERVAL_MS = 200;
@@ -121,15 +128,21 @@ export async function probeLocal(url) {
 }
 
 /** Has this URL already been downloaded and kept? */
-export async function probeCache(url) {
-  if (!url || typeof caches === 'undefined') return { ok: false, bytes: 0 };
+export async function probeStored(url) {
+  const record = await readStored(url);
+  return record ? { ok: true, bytes: record.bytes.byteLength } : { ok: false, bytes: 0 };
+}
+
+async function readStored(url) {
+  if (!url) return null;
   try {
-    const cache = await caches.open(MODEL_CACHE);
-    const hit = await cache.match(url, { ignoreVary: true });
-    if (!hit) return { ok: false, bytes: 0 };
-    return { ok: true, bytes: Number(hit.headers.get('content-length')) || 0 };
+    const record = await idbGet(STORES.WEIGHTS, KEY_PREFIX + url);
+    // A record written by a half-finished upgrade, or truncated on disk, is
+    // worse than no record: it would load and fail much further downstream.
+    if (!record?.bytes?.byteLength) return null;
+    return record;
   } catch {
-    return { ok: false, bytes: 0 };
+    return null;
   }
 }
 
@@ -149,52 +162,36 @@ export async function probeRemoteSize(url) {
 /**
  * Fetch a file, reporting progress, and keep it for next time.
  *
- * The response is cloned into Cache Storage while the original is read, so the
- * bytes are written to disk as they arrive rather than being buffered a second
- * time in JavaScript. A cache write that fails — quota, a cross-origin response
- * without CORS headers — must not fail the download, because the bytes in hand
- * are still perfectly usable for this session.
+ * A store that has it already short-circuits the network entirely — that is what
+ * makes the app work offline. A write that fails must not fail the download:
+ * the bytes in hand are usable for this session either way, so the caller is
+ * told whether they stuck rather than being thrown at.
  *
  * @returns {Promise<{ bytes: Uint8Array, cached: boolean }>}
  */
 export async function download(url, { onProgress, signal, expectedBytes = 0 } = {}) {
-  const cache = typeof caches !== 'undefined' ? await caches.open(MODEL_CACHE).catch(() => null) : null;
-
-  const hit = await cache?.match(url, { ignoreVary: true }).catch(() => null);
-  if (hit) {
-    return { bytes: await readWithProgress(hit, onProgress, expectedBytes), cached: true };
+  const stored = await readStored(url);
+  if (stored) {
+    onProgress?.(stored.bytes.byteLength, stored.bytes.byteLength);
+    return { bytes: stored.bytes, cached: true };
   }
 
   const response = await fetch(url, { signal, mode: 'cors', credentials: 'omit' });
   if (!response.ok) {
     throw new Error(`Weight download failed: ${response.status} ${response.statusText} for ${url}`);
   }
+  const bytes = await readWithProgress(response, onProgress, expectedBytes);
 
-  // Started before the body is read so both branches drain together; a lagging
-  // branch would otherwise buffer the whole file in memory.
-  let stored = false;
-  const stash = cache
-    ? cache
-        .put(url, response.clone())
-        .then(() => {
-          stored = true;
-        })
-        .catch(() => {})
-    : Promise.resolve();
-
-  let bytes;
+  let cached = false;
   try {
-    bytes = await readWithProgress(response, onProgress, expectedBytes);
-  } catch (error) {
-    // Let the cache write settle before the error propagates. Aborting the
-    // fetch errors both branches of the tee, so the put rejects and stores
-    // nothing — but a caller that evicts on failure would otherwise be racing
-    // it, and could delete the entry just before a partial one landed.
-    await stash;
-    throw error;
+    await idbSet(STORES.WEIGHTS, KEY_PREFIX + url, { bytes, storedAt: Date.now() });
+    cached = true;
+  } catch {
+    // Out of quota, or the platform refused the write. The bytes in hand still
+    // work for this session; the caller is told they did not persist, so the
+    // user can be warned rather than silently paying the download every boot.
   }
-  await stash;
-  return { bytes, cached: stored };
+  return { bytes, cached };
 }
 
 /**
@@ -240,12 +237,9 @@ async function readWithProgress(response, onProgress, expectedBytes) {
   return out;
 }
 
-/** Drop everything this module has cached, so a bad download can be retried. */
+/** Drop everything this module has stored, so a bad download can be retried. */
 export async function evict(urls) {
-  if (typeof caches === 'undefined') return;
-  const cache = await caches.open(MODEL_CACHE).catch(() => null);
-  if (!cache) return;
   for (const url of urls) {
-    if (url) await cache.delete(url, { ignoreVary: true }).catch(() => {});
+    if (url) await idbDelete(STORES.WEIGHTS, KEY_PREFIX + url).catch(() => {});
   }
 }

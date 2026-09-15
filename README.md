@@ -32,8 +32,9 @@ fallback:
    `public/models/model-config.json` to an export on a CORS-enabled host, and
    Elias offers the download from a banner in the UI. Nothing is fetched until
    the user presses the button — a phone on mobile data must not lose a gigabyte
-   to an app starting up — and the bytes are kept in Cache Storage afterwards,
-   so it is a one-time cost that survives app updates.
+   to an app starting up — and the bytes are kept in IndexedDB afterwards, so it
+   is a one-time cost that survives app updates. **This is the route that works
+   offline**, and the one to use for anything large.
 3. **Neither.** Elias boots on a **fallback reasoner**: a deterministic,
    non-neural responder that emits the same action schema the real model does,
    so the wake word, telemetry, linter, sandbox and memory are all genuinely
@@ -78,6 +79,17 @@ This was verified end to end with SmolLM2-360M-Instruct (`q4f16`, 261 MB):
 
 Note the `template` block: SmolLM2 is ChatML, not Llama-3. Swapping those four
 strings is the whole of what a differently-templated model needs.
+
+**Offline.** Once the weights are stored, the app needs no network at all.
+Verified by installing the 261 MB model, killing both the app's origin and the
+weights host, switching the browser to offline mode, reloading, and still
+getting a generated reply on the WASM backend.
+
+**Storage.** Downloaded weights go to IndexedDB rather than Cache Storage,
+because Chromium refuses a single Cache entry past roughly 200 MB — 192 MB
+stored, 256 MB failed with an opaque `UnknownError` *after* writing the bytes.
+IndexedDB took 320 MB without complaint. Budget for the origin quota too: this
+environment offered ~1 GB, which a 2B model would not fit inside.
 
 **Speed.** That run took ~50 s per reply on four desktop cores, because ONNX
 Runtime fell back to single-threaded WASM. WASM threads need
@@ -352,6 +364,9 @@ want to reproduce it, install `playwright` and script these against
   a sandbox log from inside the tool, and the answer "That comes to 47 across 3
   values."
 - **Persistence.** Reload. The tool and the memories survive.
+- **Offline operation.** Weights installed, both origins killed, browser set
+  offline, page reloaded: still `BitNet · WASM`, still generating. The only
+  requests that fail are the local `models/` probes, which are meant to.
 - **Weight provisioning.** Verified in Chromium against a purpose-built tiny
   decoder ONNX graph (`input_ids` + `attention_mask` + `position_ids`, two KV
   layers, a `logits` head) served from a second origin. All four cases: weights

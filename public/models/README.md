@@ -52,8 +52,20 @@ opaque response cannot be cached or handed to ONNX Runtime. Hugging Face
 https is rejected at boot with the field named, rather than turning into a 404
 much later.
 
+Downloaded weights are kept in IndexedDB, not Cache Storage: Chromium refuses a
+single Cache entry past roughly 200 MB — measured here, 192 MB stored and
+256 MB failed with an opaque error after writing the bytes — and that is smaller
+than any model worth running. IndexedDB took the same payloads and larger.
+
+Once they are stored the app is genuinely offline: verified by installing a
+261 MB model, killing both the app's origin and the weights host, putting the
+browser in offline mode, reloading, and getting a generated reply.
+
 Local files still win: if an export is present in this directory, it is used and
-nothing is downloaded.
+nothing is downloaded. Note that route has the opposite problem — a bundled file
+over ~200 MB cannot be held by the service worker's cache, so it is re-fetched
+from the server on every boot and will not work offline. For anything large,
+prefer the download route.
 
 ## 3. Neither — the fallback reasoner
 
