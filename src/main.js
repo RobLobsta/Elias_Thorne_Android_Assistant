@@ -770,11 +770,19 @@ function startVisualizer() {
 
 function registerServiceWorker() {
   if (!('serviceWorker' in navigator)) return;
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch((error) => {
+
+  const register = () => {
+    const base = import.meta.env.BASE_URL;
+    navigator.serviceWorker.register(`${base}sw.js`, { scope: base }).catch((error) => {
       pushTelemetry(`Service worker registration failed: ${error.message}`, 'error');
     });
-  });
+  };
+
+  // start() awaits the storage lock and the permission probe before reaching
+  // here, by which time `load` has usually already fired — waiting for it
+  // unconditionally meant the worker was never registered at all.
+  if (document.readyState === 'complete') register();
+  else window.addEventListener('load', register, { once: true });
 }
 
 /* ------------------------------------------------------------------ init */

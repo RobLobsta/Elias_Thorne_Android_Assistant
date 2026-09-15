@@ -17,6 +17,7 @@ section references below point back at it.
 | JIT tool creation, linting, sandboxed execution (§2.3) | working |
 | Self-improvement loop with pre-commit telemetry (§2.3) | working |
 | PWA shell, offline caching, TWA config (§3) | working |
+| Installable APK from GitHub Actions | working |
 | BitNet inference on WebGPU (§2.2) | needs weights — see below |
 
 The ONNX graph runner, tokenizer and sampler are implemented but cannot be
@@ -164,32 +165,108 @@ embeddings would double the memory budget on a phone; the hashing embedding is
 deterministic, free, and swappable for a real encoder in one function
 (`embed()` in `inference.worker.js`) if you have the headroom.
 
-## Packaging for Android
+## Getting it onto a phone
+
+A Trusted Web Activity is a Chrome tab in an app shell — the APK carries no web
+assets, only the URL to open. So the site has to be published before an APK can
+exist, and everything below assumes that order.
+
+Three routes, cheapest first.
+
+### 1. No APK at all
+
+Open the published site in Chrome on the phone and use **Add to home screen**.
+You get a standalone window, the microphone, the wake word and offline caching.
+This is the fastest way to check a change on real hardware, and for day-to-day
+testing it is usually enough.
+
+### 2. GitHub Actions (this repo)
+
+`.github/workflows/pages-and-apk.yml` publishes the site to GitHub Pages and
+builds a signed APK from it on every push to `main`, or on demand from the
+Actions tab.
+
+One-time setup: **Settings → Pages → Source → GitHub Actions**. Nothing else —
+no accounts, no secrets.
+
+Each run leaves an **elias-thorne-apk** artifact on the run summary. Download,
+unzip and install:
 
 ```bash
-npm run build
-# serve dist/ from your https origin, then:
-npx @bubblewrap/cli init --manifest=https://your-host/manifest.json --directory=android
-npx @bubblewrap/cli build --manifest=android/twa-manifest.json
+adb install -r app-release-signed.apk
 ```
 
-Edit `android/twa-manifest.json` first — `host`, `webManifestUrl`, `iconUrl`,
-`maskableIconUrl` and `fullScopeUrl` all point at a placeholder domain.
+Or open the artifact link on the phone and install from Chrome, once
+"install unknown apps" is allowed for the browser.
 
-**The microphone permission is the part that bites.** Bubblewrap does not add
-`RECORD_AUDIO`, and without it the TWA's `getUserMedia` fails silently at
-runtime. After `bubblewrap init`, add to the generated
-`android/app/src/main/AndroidManifest.xml`:
+By default the workflow generates a throwaway signing key per run, so the
+signature changes every build and Android will refuse to upgrade in place —
+`adb uninstall ai.eliasthorne.assistant` first. To keep one stable key, add
+these repository secrets and the workflow uses them instead:
+
+| Secret | Value |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | `base64 -w0 android.keystore` |
+| `ANDROID_KEYSTORE_PASSWORD` | the store password |
+| `ANDROID_KEY_PASSWORD` | the key password (alias `elias`) |
+
+### 3. Locally
+
+Needs a JDK; Bubblewrap downloads its own JDK 17 and Android SDK (~1.2 GB) on
+first run.
+
+```bash
+BASE_PATH=/Elias_Thorne_Android_Assistant/ npm run build
+npx vite preview --port 4173          # serves the bundle Bubblewrap reads
+
+mkdir -p build/twa && cp android/twa-manifest.json build/twa/
+cd build/twa
+npx @bubblewrap/cli update --skipVersionUpgrade
+npx @bubblewrap/cli build
+```
+
+`update --skipVersionUpgrade` generates the whole Android project from
+`twa-manifest.json` without prompting. Plain `update` stops to ask for a version
+name, and `init` is fully interactive — neither works unattended.
+
+### Three things that will bite
+
+**Microphone permission.** Bubblewrap does not add `RECORD_AUDIO`, and without
+it `getUserMedia` fails inside the TWA with no visible error — the wake word
+just never fires. The workflow patches the generated manifest; if you build by
+hand, add this to `build/twa/app/src/main/AndroidManifest.xml` before building:
 
 ```xml
 <uses-permission android:name="android.permission.RECORD_AUDIO" />
 <uses-feature android:name="android.hardware.microphone" android:required="true" />
 ```
 
-Also publish `/.well-known/assetlinks.json` with the signing-key fingerprint
-Bubblewrap prints, or the TWA falls back to a Custom Tab with a URL bar.
+**Android SDK licences.** Gradle fails at `:app:minifyReleaseWithR8` with
+"licences have not been accepted" unless they are accepted first. The workflow
+runs `sdkmanager --licenses`; locally, `yes | sdkmanager --licenses` once.
 
-Serve the built app with:
+**The URL bar.** Removing it needs `/.well-known/assetlinks.json` served from
+the *domain root* with the signing key's fingerprint. On a project Pages site
+the root is `roblobsta.github.io`, which this repository cannot publish to — so
+the TWA shows a thin URL bar. It is cosmetic and does not affect the
+microphone, the wake word or anything else. To get rid of it, serve the app
+from a root domain (or a `roblobsta.github.io` user-site repo) and publish the
+`assetlinks.json` the workflow emits alongside the APK.
+
+### Deploying elsewhere
+
+The build is base-path aware. `BASE_PATH` sets where it will be served:
+
+```bash
+BASE_PATH=/ npm run build                   # domain root
+BASE_PATH=/some/prefix/ npm run build       # subpath
+```
+
+It rewrites the Vite base, the manifest's `id`/`start_url`/`scope`/icons, and
+the service worker's precache list; the worker reads its own registration scope
+at runtime, and the model and ONNX runtime directories hang off `BASE_URL`.
+
+If the host can set headers, send:
 
 ```
 Cross-Origin-Opener-Policy: same-origin
@@ -197,7 +274,10 @@ Cross-Origin-Embedder-Policy: credentialless
 ```
 
 `credentialless` rather than `require-corp` so the sandbox's ESM imports keep
-working. The dev and preview servers already send both.
+working. The dev and preview servers already send both. GitHub Pages cannot set
+headers, so the page is not cross-origin isolated there: WebGPU — the primary
+inference path — is unaffected, but the ONNX WASM fallback loses
+`SharedArrayBuffer` and runs single-threaded.
 
 ## Verifying
 
@@ -219,11 +299,21 @@ want to reproduce it, install `playwright` and script these against
   and a non-allow-listed dependency are both refused; and that a hanging tool
   times out, marks the sandbox poisoned and demands a respawn.
 
-Not verified here: a successful live import from `esm.sh` and the fetch
-throttle's timing. The sandbox this was built in proxies egress through a TLS
-interceptor that its Chromium build does not trust, so every browser request to
-a CDN fails at the TLS layer. The allow-list rejection path and the import
-failure path are both verified; the success path is not.
+The APK toolchain was run end to end and the resulting APK inspected with
+`aapt2` and `apksigner`: package `ai.eliasthorne.assistant`, `RECORD_AUDIO` and
+`android.hardware.microphone` present, the launch URL baked in as
+`https://roblobsta.github.io/Elias_Thorne_Android_Assistant/`, and a valid
+signature. The subpath build was driven in Chromium too — full agent loop,
+service worker registered at the right scope, and a styled render after an
+offline reload.
+
+Not verified here: a successful live import from `esm.sh`, the fetch throttle's
+timing, and the workflow running on GitHub's own runners. The sandbox this was
+built in proxies egress through a TLS interceptor that its Chromium build does
+not trust, so every browser request to a CDN fails at the TLS layer. The
+allow-list rejection path and the import failure path are both verified; the
+success path is not. Every step of the workflow was rehearsed locally against
+the same commands, but the first Actions run is still the first Actions run.
 
 ## Known limitations
 

@@ -21,17 +21,47 @@ const SHELL_CACHE = `elias-shell-${VERSION}`;
 // change, and expect a full re-download when you do.
 const MODEL_CACHE = 'elias-models';
 
-const SHELL_ASSETS = ['/', '/index.html', '/manifest.json', '/icons/icon-192.png'];
+/**
+ * The deployment base, taken from the worker's own registration scope, so the
+ * same file works at a domain root or under a GitHub Pages project subpath
+ * with no build-time templating.
+ */
+const BASE = new URL(self.registration.scope).pathname;
+
+/**
+ * Hashed build outputs, injected by the Vite plugin at build time.
+ *
+ * These must be precached explicitly: on a first visit the page requests them
+ * before this worker has claimed the client, so they never pass through the
+ * fetch handler and would otherwise be absent from the cache the first time
+ * the device goes offline.
+ */
+const BUILD_ASSETS = [];
+
+const SHELL_ASSETS = [
+  BASE,
+  `${BASE}index.html`,
+  `${BASE}manifest.json`,
+  `${BASE}icons/icon-192.png`,
+  ...BUILD_ASSETS,
+];
 
 /** Immutable, large, cache-first. */
-const IMMUTABLE_PREFIXES = ['/models/', '/ort/'];
+const IMMUTABLE_PREFIXES = [`${BASE}models/`, `${BASE}ort/`];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches
       .open(SHELL_CACHE)
-      .then((cache) => cache.addAll(SHELL_ASSETS))
-      .catch(() => {})
+      .then((cache) =>
+        // Individually, not addAll: one missing entry must not abandon the
+        // whole precache.
+        Promise.all(
+          SHELL_ASSETS.map((asset) =>
+            cache.add(new Request(asset, { cache: 'reload' })).catch(() => {}),
+          ),
+        ),
+      )
       .then(() => self.skipWaiting()),
   );
 });
@@ -101,7 +131,7 @@ async function staleWhileRevalidate(request, cacheName) {
 
   // Offline with nothing cached: fall back to the shell for navigations.
   if (request.mode === 'navigate') {
-    const shell = await cache.match('/index.html', { ignoreVary: true });
+    const shell = await cache.match(`${BASE}index.html`, { ignoreVary: true });
     if (shell) return shell;
   }
   return new Response('Offline and not cached.', { status: 503, statusText: 'Offline' });

@@ -43,7 +43,13 @@ const MAX_CORRECTION_PASSES = 3;
 /** Conversation turns kept in the rolling context window. */
 const HISTORY_TURNS = 6;
 
-const MODELS_BASE = new URL('/models/', self.location.origin);
+/**
+ * Deployment base, injected by Vite. Both the model directory and the staged
+ * ONNX runtime hang off it, so the worker addresses them correctly whether the
+ * app is served from a domain root or a GitHub Pages subpath.
+ */
+const APP_BASE = new URL(import.meta.env.BASE_URL, self.location.origin);
+const MODELS_BASE = new URL('models/', APP_BASE);
 
 /** Defaults matching the published BitNet b1.58-2B-4T configuration. Override
  * them in public/models/model-config.json to match your own ONNX export. */
@@ -385,7 +391,7 @@ class SandboxBridge {
  * the first inference works with the radio off, which matters for an agent
  * whose whole premise is that it runs on the handset.
  */
-const ORT_BASE = '/ort/';
+const ORT_BASE = new URL('ort/', APP_BASE).toString();
 let ortModule = null;
 
 function loadOrt() {

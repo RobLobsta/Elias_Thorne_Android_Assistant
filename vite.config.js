@@ -8,6 +8,21 @@ const root = dirname(fileURLToPath(import.meta.url));
 const appRoot = resolve(root, 'public');
 const outDir = resolve(root, 'dist');
 
+/**
+ * Deployment base path, e.g. "/Elias_Thorne_Android_Assistant/" for a GitHub
+ * Pages project site. Everything the app addresses by absolute URL — the
+ * manifest, the service worker and its scope, the staged ONNX runtime, the
+ * model directory — is derived from this, so the same build works at a
+ * subpath or at a domain root.
+ */
+const BASE = normaliseBase(process.env.BASE_PATH ?? '/');
+
+function normaliseBase(value) {
+  const trimmed = String(value).trim();
+  if (!trimmed || trimmed === '/') return '/';
+  return `/${trimmed.replace(/^\/+|\/+$/g, '')}/`;
+}
+
 // The SAD blueprint places index.html inside public/, so public/ is the Vite
 // root rather than its static directory. These assets therefore need copying
 // by hand instead of relying on Vite's implicit publicDir behaviour.
@@ -21,8 +36,8 @@ const STATIC_ASSETS = ['manifest.json', 'sw.js', 'icons', 'models', 'ort'];
  * removed.
  */
 const STABLE_URLS = [
-  { url: '/manifest.json', pattern: /\/assets\/manifest-[A-Za-z0-9_-]+\.json/g },
-  { url: '/icons/icon-192.png', pattern: /\/assets\/icon-192-[A-Za-z0-9_-]+\.png/g },
+  { path: 'manifest.json', pattern: /\/?(?:[\w.-]+\/)*assets\/manifest-[A-Za-z0-9_-]+\.json/g },
+  { path: 'icons/icon-192.png', pattern: /\/?(?:[\w.-]+\/)*assets\/icon-192-[A-Za-z0-9_-]+\.png/g },
 ];
 
 /**
@@ -79,6 +94,11 @@ function copyStaticAssets() {
       }
 
       await restoreStableUrls();
+      await rebaseManifest();
+      await injectPrecacheList();
+      // GitHub Pages runs Jekyll on branch-based publishes, which drops files
+      // and directories beginning with an underscore.
+      await writeFile(resolve(outDir, '.nojekyll'), '');
 
       const models = resolve(outDir, 'models');
       if (existsSync(models)) {
@@ -101,10 +121,11 @@ async function restoreStableUrls() {
   let html = await readFile(indexPath, 'utf8');
   const orphans = new Set();
 
-  for (const { url, pattern } of STABLE_URLS) {
+  for (const { path, pattern } of STABLE_URLS) {
     html = html.replace(pattern, (match) => {
-      orphans.add(match.replace(/^\//, ''));
-      return url;
+      const relative = match.replace(/^\//, '').replace(BASE.replace(/^\//, ''), '');
+      orphans.add(relative);
+      return BASE + path;
     });
   }
 
@@ -112,6 +133,64 @@ async function restoreStableUrls() {
   for (const orphan of orphans) {
     await rm(resolve(outDir, orphan), { force: true });
   }
+}
+
+/**
+ * The web app manifest is authored with root-absolute URLs, which is correct
+ * for dev and for a domain-root deploy. Rebase them when building for a
+ * subpath — a manifest whose scope does not cover start_url makes the app
+ * uninstallable, and Bubblewrap reads these same values.
+ */
+async function rebaseManifest() {
+  if (BASE === '/') return;
+  const manifestPath = resolve(outDir, 'manifest.json');
+  if (!existsSync(manifestPath)) return;
+
+  const rebase = (value) => {
+    if (typeof value === 'string') {
+      return value.startsWith('/') && !value.startsWith('//')
+        ? BASE.replace(/\/$/, '') + value
+        : value;
+    }
+    if (Array.isArray(value)) return value.map(rebase);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, rebase(v)]));
+    }
+    return value;
+  };
+
+  const manifest = rebase(JSON.parse(await readFile(manifestPath, 'utf8')));
+  manifest.id = BASE;
+  manifest.start_url = BASE;
+  manifest.scope = BASE;
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+/**
+ * Write the emitted asset filenames into the service worker's precache list.
+ *
+ * The service worker is a plain static file, so it cannot know the hashed
+ * names Rollup produced. Without this the first offline load renders unstyled.
+ */
+async function injectPrecacheList() {
+  const swPath = resolve(outDir, 'sw.js');
+  const assetsDir = resolve(outDir, 'assets');
+  if (!existsSync(swPath) || !existsSync(assetsDir)) return;
+
+  const assets = (await readdir(assetsDir))
+    .filter((file) => !file.endsWith('.map'))
+    .map((file) => `${BASE}assets/${file}`)
+    .sort();
+
+  const sw = await readFile(swPath, 'utf8');
+  const injected = sw.replace(
+    /const BUILD_ASSETS = \[\];/,
+    `const BUILD_ASSETS = ${JSON.stringify(assets)};`,
+  );
+  if (injected === sw) {
+    this?.warn?.('Could not find the BUILD_ASSETS placeholder in sw.js.');
+  }
+  await writeFile(swPath, injected);
 }
 
 // WebGPU does not require cross-origin isolation, but the ONNX Runtime WASM
@@ -125,7 +204,7 @@ const isolationHeaders = {
 export default defineConfig({
   root: appRoot,
   publicDir: false,
-  base: '/',
+  base: BASE,
   plugins: [stageOnnxRuntime(), copyStaticAssets()],
   server: {
     host: true,
