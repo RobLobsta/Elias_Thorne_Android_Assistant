@@ -3,6 +3,8 @@ package ai.eliasthorne.assistant
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -36,6 +38,17 @@ class Voice(private val context: Context) {
 
     var listener: Listener? = null
 
+    /**
+     * TextToSpeech delivers UtteranceProgressListener callbacks on a binder
+     * thread, and SpeechRecognizer is main-thread-only. Everything is hopped to
+     * the main thread here so a listener can touch views without the exception
+     * being thrown inside a framework callback, where it is swallowed and the UI
+     * is simply left stuck.
+     */
+    private val main = Handler(Looper.getMainLooper())
+
+    private fun post(block: () -> Unit) = main.post(block)
+
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -51,11 +64,11 @@ class Voice(private val context: Context) {
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {}
                     override fun onDone(utteranceId: String?) {
-                        listener?.onSpeakingFinished()
+                        post { listener?.onSpeakingFinished() }
                     }
                     @Deprecated("platform signature")
                     override fun onError(utteranceId: String?) {
-                        listener?.onSpeakingFinished()
+                        post { listener?.onSpeakingFinished() }
                     }
                 })
             } else {
@@ -121,12 +134,18 @@ class Voice(private val context: Context) {
 
     fun speak(text: String) {
         if (!ttsReady || text.isBlank()) {
-            listener?.onSpeakingFinished()
+            post { listener?.onSpeakingFinished() }
             return
         }
         // QUEUE_FLUSH so a barge-in cuts the previous sentence rather than
         // queueing behind it.
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, UTTERANCE_ID)
+        val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, UTTERANCE_ID)
+        // A refused utterance produces no callback at all — a device with no
+        // voice data returns ERROR here and then stays silent forever.
+        if (result != TextToSpeech.SUCCESS) {
+            Log.w(TAG, "speak() refused (code $result); continuing without audio")
+            post { listener?.onSpeakingFinished() }
+        }
     }
 
     fun stopSpeaking() {

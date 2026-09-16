@@ -39,15 +39,7 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
     private lateinit var talkButton: Button
     private lateinit var modelButton: Button
 
-    /**
-     * No system turn by default.
-     *
-     * BitNet 2B4T is small enough that a system prompt hurts: it paraphrases the
-     * instructions back instead of answering, and the reply degenerates. Asked
-     * the same question with and without one, without wins clearly. Left as a
-     * list so a stronger model swapped in through the picker can be given one.
-     */
-    private val history = mutableListOf<LlamaBridge.Message>()
+    private val history = mutableListOf(LlamaBridge.Message("system", SYSTEM_PROMPT))
 
     private var generating: Job? = null
     private var cancelled: java.util.concurrent.atomic.AtomicBoolean? = null
@@ -254,11 +246,14 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
             history += LlamaBridge.Message("assistant", spoken)
             trimHistory()
 
+            // Re-enable input the moment generation ends, never on a speech
+            // callback. Routing it through TextToSpeech meant a device that
+            // refuses an utterance — no voice data installed, engine missing —
+            // left the composer disabled for good, with no way to notice.
+            setBusy(false)
             if (spoken.isNotBlank()) {
                 speaking = true
                 voice.speak(spoken)
-            } else {
-                setBusy(false)
             }
         }
     }
@@ -324,12 +319,16 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
 
     override fun onSpeakingFinished() {
         speaking = false
-        setBusy(false)
+        // Only refreshes the Talk/Stop label; the composer was re-enabled when
+        // generation finished and must not be touched from here.
+        if (generating == null) setBusy(false)
     }
 
     /* ---------------------------------------------------------------- ui */
 
     private fun setBusy(busy: Boolean) {
+        // Typing is allowed while Elias is talking — only an in-flight
+        // generation blocks it, because the context can serve one at a time.
         sendButton.isEnabled = !busy && llama.isLoaded
         input.isEnabled = !busy && llama.isLoaded
         talkButton.text = when {
@@ -374,6 +373,32 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
     }
 
     companion object {
+        /**
+         * The identity turn. Edit this to change who Elias is.
+         *
+         * Without one, a model answers as whatever its training data suggests —
+         * Qwen says "developed by Alibaba Cloud". Two findings from testing
+         * variants against a 0.5B, both counter-intuitive enough to be worth
+         * recording:
+         *
+         * Negation backfires. "You are not made by any AI company" put the idea
+         * of AI companies into context and the model duly picked one, answering
+         * "created by Anthropic" — strictly worse than saying nothing.
+         *
+         * A positive, concrete origin works better than a denial, because it
+         * fills the slot the question opens rather than leaving it empty.
+         *
+         * An explicit "if asked who you are, say X" makes the *name* reliable.
+         * Provenance is not: a sub-1B model will still invent a creator when
+         * asked directly, and no wording tested here prevented it. That is model
+         * capacity, not prompting — expect it to improve with a larger model
+         * rather than a better sentence.
+         */
+        private const val SYSTEM_PROMPT =
+            "You are Elias Thorne, a private assistant running entirely on this phone. " +
+                "You were set up by the owner of this device. " +
+                "If asked who you are, say: Elias Thorne. Answer briefly."
+
         private const val CONTEXT_TOKENS = 2048
         private const val MAX_TOKENS = 160
         private const val TEMPERATURE = 0.7f

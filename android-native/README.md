@@ -172,6 +172,49 @@ Threads are set to `cores - 1`, capped at 6. On a big.LITTLE phone that includes
 the little cores, which can be slower than using the big ones alone — worth
 trying 4 if throughput disappoints.
 
+## Notes from running it on a real phone
+
+Measured on a 4 GB device, Qwen2 1B Q4_K_M (0.39 GB), 6 threads,
+`neon=yes dotprod=yes i8mm=NO fp16va=yes`:
+
+```
+prompt   116 tok @ 45.9 tok/s
+generate  13 tok @ 13.96 tok/s
+```
+
+Usable, and it confirms the residency argument above: the same app with a 1.2 GB
+model on the same phone managed 0.3 tok/s. Model size against free RAM is the
+lever that matters.
+
+### The composer locking up after the first reply
+
+Re-enabling the text box hung off `UtteranceProgressListener.onDone`, which is
+two separate ways to deadlock the UI. `TextToSpeech.speak()` returns `ERROR` and
+then stays silent on a device with no voice data, so the callback never comes;
+and those callbacks arrive on a binder thread, so touching a view from one
+throws `CalledFromWrongThreadException` *inside a framework callback*, where it
+is swallowed and the app simply sits there disabled.
+
+Typing now never depends on speech: the composer is re-enabled when generation
+ends, and speaking is a separate state that only changes the Talk button. All
+`Voice` callbacks are posted to the main thread, and a refused utterance is
+detected from `speak()`'s return code.
+
+### It said it was made by someone else
+
+`SYSTEM_PROMPT` in `MainActivity` is the identity turn; it had been removed
+because BitNet 2B4T degrades when given one. Restoring it took some measuring,
+and two results were counter-intuitive:
+
+- **Negation backfires.** "You are not made by any AI company" made a Qwen 0.5B
+  answer *"created by Anthropic"* — worse than no system prompt at all, which
+  gave the merely-wrong "developed by Alibaba Cloud". Naming the category
+  invites the model to pick from it.
+- **The name is fixable; the provenance is not.** "If asked who you are, say X"
+  makes the name reliable. Asked *who made you*, a sub-1B model still invents a
+  creator, and no wording tested here stopped it. Expect a larger model to help
+  where a better sentence will not.
+
 ## If it crashes
 
 Get the native stack, which is the only thing that identifies the cause:
