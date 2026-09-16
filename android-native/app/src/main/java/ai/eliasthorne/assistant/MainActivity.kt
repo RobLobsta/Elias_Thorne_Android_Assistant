@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.text.method.ScrollingMovementMethod
 import android.view.View
 import android.widget.Button
@@ -38,15 +39,18 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
     private lateinit var talkButton: Button
     private lateinit var modelButton: Button
 
-    private val history = mutableListOf(
-        LlamaBridge.Message(
-            "system",
-            "You are Elias Thorne, an assistant running entirely on this device. " +
-                "Answer in one or two short sentences. Never invent a further question.",
-        ),
-    )
+    /**
+     * No system turn by default.
+     *
+     * BitNet 2B4T is small enough that a system prompt hurts: it paraphrases the
+     * instructions back instead of answering, and the reply degenerates. Asked
+     * the same question with and without one, without wins clearly. Left as a
+     * list so a stronger model swapped in through the picker can be given one.
+     */
+    private val history = mutableListOf<LlamaBridge.Message>()
 
     private var generating: Job? = null
+    private var cancelled: java.util.concurrent.atomic.AtomicBoolean? = null
     private var speaking = false
 
     private val pickModel = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -164,21 +168,42 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
         val start = System.nanoTime()
         var tokens = 0
         val reply = StringBuilder()
+        // The listener runs on the inference thread while the UI thread reads
+        // what it has produced, so the buffer needs a lock of its own; a bare
+        // StringBuilder shared across the two is a data race.
+        val replyLock = Any()
+        // Set from the UI thread, read from the inference thread — the Job
+        // reference itself is not assigned until launch() returns, which is
+        // after the first tokens have already arrived.
+        val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        this.cancelled = cancelled
         append("Elias", "")
 
+        // Snapshot the conversation: generate() walks it on another thread and
+        // this list keeps being appended to on this one.
+        val conversation = history.toList()
+
         generating = lifecycleScope.launch {
-            val full = llama.generate(history, MAX_TOKENS, TEMPERATURE) { piece ->
-                tokens++
-                reply.append(piece)
-                runOnUiThread { replaceLast("Elias", reply.toString()) }
-                // The listener runs on the inference thread; returning false is
-                // how the stop button lands mid-generation.
-                generating?.isCancelled != true
+            val full = try {
+                llama.generate(conversation, MAX_TOKENS, TEMPERATURE) { piece ->
+                    tokens++
+                    val soFar = synchronized(replyLock) {
+                        reply.append(piece)
+                        reply.toString()
+                    }
+                    runOnUiThread { replaceLast("Elias", soFar) }
+                    !cancelled.get()
+                }
+            } catch (e: Throwable) {
+                // Anything unexpected belongs on screen, not in a crash dialog.
+                Log.e("elias", "generation failed", e)
+                ""
             }
             generating = null
 
             val seconds = (System.nanoTime() - start) / 1e9
-            val spoken = full.ifBlank { reply.toString() }.trim()
+            val partial = synchronized(replyLock) { reply.toString() }
+            val spoken = full.ifBlank { partial }.trim()
             replaceLast("Elias", spoken.ifBlank { "…" })
             status.text = getString(
                 R.string.status_spoke, tokens, seconds, if (seconds > 0) tokens / seconds else 0.0,
@@ -196,6 +221,7 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
     }
 
     private fun cancelGeneration() {
+        cancelled?.set(true)
         llama.stop()
         generating?.cancel()
         generating = null
@@ -206,11 +232,12 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
     /**
      * Keep the conversation inside the context window.
      *
-     * The system turn is never dropped — without it the model forgets who it is
-     * and starts answering as the user.
+     * A system turn, if one is present, is never dropped — it is the only thing
+     * holding the model's role in place once the older turns fall out.
      */
     private fun trimHistory() {
-        while (history.size > 1 + MAX_TURNS * 2) history.removeAt(1)
+        val keepSystem = if (history.firstOrNull()?.role == "system") 1 else 0
+        while (history.size > keepSystem + MAX_TURNS * 2) history.removeAt(keepSystem)
     }
 
     /* ------------------------------------------------------------- voice */
@@ -308,6 +335,6 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
         private const val MAX_TOKENS = 160
         private const val TEMPERATURE = 0.7f
         /** User+assistant pairs kept before the oldest is dropped. */
-        private const val MAX_TURNS = 6
+        private const val MAX_TURNS = 3
     }
 }

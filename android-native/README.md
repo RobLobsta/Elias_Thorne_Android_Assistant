@@ -110,6 +110,31 @@ clang++ -O2 -std=c++17 -o elias-test \
 ./elias-test model.gguf "What is the capital of France?"
 ```
 
+## If it crashes
+
+Get the native stack, which is the only thing that identifies the cause:
+
+```bash
+adb logcat -c && adb logcat | tee crash.log      # then reproduce
+grep -E "elias-native|DEBUG|FATAL|JNI DETECTED" crash.log
+```
+
+Two crash causes have already been found and fixed — by code inspection and by
+reproducing the conditions on a desktop, not from a device log, since no device
+was available. Both abort the process rather than raising anything catchable,
+which is why they read as "the app closes" with no error:
+
+- **Invalid Modified UTF-8 into `NewStringUTF`.** Byte-level BPE splits
+  multi-byte characters across tokens — `😀` arrives as a 3-byte piece then a
+  1-byte piece — and Android's CheckJNI aborts on malformed input rather than
+  returning an error. `elias_core` now holds a partial character back until the
+  token that completes it, and `test_cli` asserts the invariant on every piece.
+- **A dangling token pointer.** `llama_batch_get_one` stores the pointer it is
+  given rather than copying it, so a `llama_token` declared inside the decode
+  loop was read back by the next `llama_decode` after going out of scope. It
+  survived on x86 by landing in the same stack slot each iteration; different
+  code generation is free to do otherwise.
+
 ## What has been verified, and what has not
 
 Verified on an x86 host and by inspecting the built APK:
@@ -128,12 +153,18 @@ Not verified, and the honest gaps:
 - **Nothing has run on a phone.** There was no device or emulator available, and
   no qemu to execute arm64 here. The APK builds and contains the right code; it
   has never been launched.
-- **Conversational quality is mediocre.** Factual completion is sound, but
-  multi-clause questions drift and repeat, and arithmetic loops. That is BitNet
-  2B4T at this quantisation, not the plumbing — the same prompts through the
-  same core produce the same behaviour on the host. If it disappoints, any
-  instruct GGUF can be swapped in via the same picker, and its own chat template
-  will be used.
+- **Conversational quality is poor, and this is the honest headline.** A single
+  factual question is answered correctly — *"The capital of France is Paris."* —
+  but multi-turn conversation degrades badly, with the model referring to
+  earlier turns incoherently, and arithmetic loops. Two things were measured and
+  applied: a repetition penalty of 1.25 over a 256-token window (at 1.1 it
+  answered and then looped for the entire token budget; at 1.25 it answers and
+  stops), and no system turn (the model paraphrases instructions back instead of
+  following them). Both help. Neither makes it good. This is BitNet 2B4T at
+  `i2_s`, not the plumbing — the same prompts through the same core behave the
+  same on a desktop. If it disappoints, any instruct GGUF can be swapped in
+  through the same picker and its own chat template will be used;
+  Qwen2.5-1.5B-Instruct at Q4_K_M is a similar size and much stronger at chat.
 - **Speech recognition may need a network.** The model does not, but Android's
   `SpeechRecognizer` is usually server-backed. The app asks for on-device
   recognition (`EXTRA_PREFER_OFFLINE`) and falls back to typing, which always

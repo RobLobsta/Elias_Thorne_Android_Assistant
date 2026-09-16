@@ -48,7 +48,15 @@ Java_ai_eliasthorne_assistant_LlamaBridge_nativeLoad(JNIEnv * env, jobject /*thi
     std::string error;
     LOGI("loading %s (threads=%d ctx=%d)", gguf.c_str(), session->params.n_threads,
          session->params.n_ctx);
-    session->model = elias::Model::load(gguf, session->params, error);
+    try {
+        session->model = elias::Model::load(gguf, session->params, error);
+    } catch (const std::exception & e) {
+        error = e.what();
+        session->model = nullptr;
+    } catch (...) {
+        error = "the model loader threw an unknown exception";
+        session->model = nullptr;
+    }
 
     if (!session->model) {
         LOGE("load failed: %s", error.c_str());
@@ -92,10 +100,14 @@ Java_ai_eliasthorne_assistant_LlamaBridge_nativeGenerate(JNIEnv * env, jobject /
                                                          jint max_tokens, jfloat temperature,
                                                          jobject listener) {
     auto * s = as_session(handle);
-    if (!s) return env->NewStringUTF("");
+    if (!s || !roles || !contents) return env->NewStringUTF("");
 
     std::vector<elias::Message> messages;
     const jsize n = env->GetArrayLength(roles);
+    if (n != env->GetArrayLength(contents)) {
+        LOGE("roles/contents length mismatch");
+        return env->NewStringUTF("");
+    }
     messages.reserve(n);
     for (jsize i = 0; i < n; ++i) {
         auto role = static_cast<jstring>(env->GetObjectArrayElement(roles, i));
@@ -117,23 +129,42 @@ Java_ai_eliasthorne_assistant_LlamaBridge_nativeGenerate(JNIEnv * env, jobject /
     }
 
     std::string error;
-    const std::string reply = s->model->generate(messages, params,
-        [&](const std::string & piece) -> bool {
-            if (!on_token) return true;
-            jstring jpiece = env->NewStringUTF(piece.c_str());
-            const jboolean keep_going = env->CallBooleanMethod(listener, on_token, jpiece);
-            env->DeleteLocalRef(jpiece);
-            // An exception thrown by the listener must not be swallowed into a
-            // half-finished generation.
-            if (env->ExceptionCheck()) {
-                env->ExceptionClear();
-                return false;
-            }
-            return keep_going == JNI_TRUE;
-        }, error);
+    std::string reply;
+    try {
+        reply = s->model->generate(messages, params,
+            [&](const std::string & piece) -> bool {
+                if (!on_token) return true;
+                // elias_core only ever hands over complete UTF-8; were that not
+                // so, NewStringUTF would abort the whole process rather than
+                // fail, so it is worth not relying on luck.
+                jstring jpiece = env->NewStringUTF(piece.c_str());
+                if (!jpiece) {
+                    env->ExceptionClear();
+                    return false;
+                }
+                const jboolean keep_going = env->CallBooleanMethod(listener, on_token, jpiece);
+                env->DeleteLocalRef(jpiece);
+                // An exception thrown by the listener must not be swallowed into
+                // a half-finished generation.
+                if (env->ExceptionCheck()) {
+                    env->ExceptionDescribe();
+                    env->ExceptionClear();
+                    return false;
+                }
+                return keep_going == JNI_TRUE;
+            }, error);
+    } catch (const std::exception & e) {
+        // A C++ exception unwinding through a JNI frame terminates the process.
+        LOGE("generate threw: %s", e.what());
+        return env->NewStringUTF("");
+    } catch (...) {
+        LOGE("generate threw an unknown exception");
+        return env->NewStringUTF("");
+    }
 
     if (!error.empty()) LOGE("generate: %s", error.c_str());
-    return env->NewStringUTF(reply.c_str());
+    jstring out = env->NewStringUTF(reply.c_str());
+    return out ? out : env->NewStringUTF("");
 }
 
 }  // extern "C"

@@ -21,6 +21,34 @@ std::string capitalise(const std::string & role) {
     return out;
 }
 
+/**
+ * Length of the longest prefix of `s` that is complete, well-formed UTF-8.
+ *
+ * Byte-level BPE splits multi-byte characters across tokens — an emoji arrives
+ * as a 3-byte piece followed by a 1-byte piece — so a single token's text is
+ * often half a character. Handing that to JNI's NewStringUTF is not merely
+ * untidy: Android's CheckJNI aborts the process with "input is not valid
+ * Modified UTF-8", which reads as a crash with no output at all.
+ */
+size_t complete_utf8_prefix(const std::string & s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        size_t len;
+        if (c < 0x80)            len = 1;
+        else if ((c >> 5) == 6)  len = 2;
+        else if ((c >> 4) == 14) len = 3;
+        else if ((c >> 3) == 30) len = 4;
+        else return i;  // a stray continuation byte: stop before it
+        if (i + len > s.size()) return i;  // the tail is a partial character
+        for (size_t k = 1; k < len; ++k) {
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return i;
+        }
+        i += len;
+    }
+    return i;
+}
+
 /** llama.cpp logs every graph reservation at INFO; quiet unless something breaks. */
 void quiet_log(ggml_log_level level, const char * text, void * /*user*/) {
     if (level >= GGML_LOG_LEVEL_WARN) fputs(text, stderr);
@@ -176,6 +204,10 @@ std::string Model::generate(const std::vector<Message> & messages, const Params 
 
     const int n_prompt = -llama_tokenize(impl_->vocab, prompt.c_str(), (int32_t) prompt.size(),
                                          nullptr, 0, true, true);
+    if (n_prompt <= 0) {
+        error = "the prompt could not be tokenized";
+        return {};
+    }
     std::vector<llama_token> tokens(n_prompt);
     if (llama_tokenize(impl_->vocab, prompt.c_str(), (int32_t) prompt.size(), tokens.data(),
                        (int32_t) tokens.size(), true, true) < 0) {
@@ -207,6 +239,14 @@ std::string Model::generate(const std::vector<Message> & messages, const Params 
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(params.seed));
 
     std::string reply;
+    // Held across iterations on purpose. llama_batch_get_one stores the pointer
+    // it is given rather than copying, so a token declared inside the loop would
+    // be read back by the next llama_decode after going out of scope.
+    llama_token id = 0;
+    // Carries a partial multi-byte character between tokens; see
+    // complete_utf8_prefix.
+    std::string pending;
+
     llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t) tokens.size());
 
     for (int decoded = 0; decoded < params.n_predict; ++decoded) {
@@ -217,7 +257,7 @@ std::string Model::generate(const std::vector<Message> & messages, const Params 
             break;
         }
 
-        llama_token id = llama_sampler_sample(smpl, impl_->ctx, -1);
+        id = llama_sampler_sample(smpl, impl_->ctx, -1);
         if (llama_vocab_is_eog(impl_->vocab, id)) break;
         if (std::find(impl_->stop_ids.begin(), impl_->stop_ids.end(), id) != impl_->stop_ids.end()) break;
 
@@ -243,12 +283,24 @@ std::string Model::generate(const std::vector<Message> & messages, const Params 
         }
         if (leaked) break;
 
-        if (cb && !cb(piece)) break;
+        // Only hand on whole characters; anything half-finished waits for the
+        // token that completes it.
+        pending += piece;
+        const size_t whole = complete_utf8_prefix(pending);
+        if (whole > 0) {
+            const std::string emit = pending.substr(0, whole);
+            pending.erase(0, whole);
+            if (cb && !cb(emit)) break;
+        }
 
         batch = llama_batch_get_one(&id, 1);
     }
 
     llama_sampler_free(smpl);
+
+    // A reply cut short by the token budget can end mid-character; the caller
+    // passes this straight to NewStringUTF, so it must be whole.
+    reply.resize(complete_utf8_prefix(reply));
 
     // Trim the trailing whitespace the template's "Assistant: " tends to attract.
     while (!reply.empty() && (reply.back() == '\n' || reply.back() == ' ')) reply.pop_back();

@@ -22,8 +22,11 @@ struct Params {
     float temperature = 0.7f;
     float top_p       = 0.9f;
     int   top_k       = 40;
-    float repeat_penalty = 1.1f;
-    int   repeat_last_n  = 128;
+    // Measured against BitNet 2B4T: at 1.1 it answers correctly and then loops
+    // for the whole token budget; at 1.25 over a 256-token window it answers and
+    // stops. Higher again starts mangling grammar.
+    float repeat_penalty = 1.25f;
+    int   repeat_last_n  = 256;
     uint32_t seed     = 0xFFFFFFFF;  // LLAMA_DEFAULT_SEED
 };
 
