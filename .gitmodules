@@ -1,0 +1,3 @@
+[submodule "android-native/app/src/main/cpp/bitnet"]
+	path = android-native/app/src/main/cpp/bitnet
+	url = https://github.com/microsoft/BitNet

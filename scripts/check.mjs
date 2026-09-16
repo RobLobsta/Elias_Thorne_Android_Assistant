@@ -10,6 +10,7 @@
 import assert from 'node:assert/strict';
 import { matchWakeAnchor, isInterruptToken, buildPersonaBlock, WAKE_ANCHORS, INTERRUPT_TOKENS } from '../src/utils/persona.js';
 import { extractAction, validateAction, SchemaError, isFetchAllowed } from '../src/utils/schema.js';
+import { resolveWeightSources } from '../src/utils/weights.js';
 
 let pass = 0;
 const check = (name, fn) => {
@@ -86,6 +87,71 @@ check('fetch allow-list accepts esm.sh over https only', () => {
   assert.ok(isFetchAllowed('https://esm.sh/x'));
   assert.ok(!isFetchAllowed('http://esm.sh/x'));
   assert.ok(!isFetchAllowed('https://evil.example/x'));
+});
+
+console.log('\nweight sources (SAD 2.2)');
+const MODELS = 'https://owner.github.io/repo/models/';
+check('with no remote configured, only the local path is offered', () => {
+  const s = resolveWeightSources({ modelFile: 'bitnet-2b4t.onnx' }, MODELS);
+  assert.equal(s.model.local, `${MODELS}bitnet-2b4t.onnx`);
+  assert.equal(s.model.remote, null);
+  assert.equal(s.tokenizer.local, `${MODELS}tokenizer.json`);
+  assert.equal(s.tokenizer.remote, null);
+  assert.equal(s.externalData, null);
+});
+check('the tokenizer defaults to sitting beside the remote weights', () => {
+  const s = resolveWeightSources(
+    { modelFile: 'm.onnx', weightsUrl: 'https://hf.example/r/resolve/main/m.onnx' },
+    MODELS,
+  );
+  assert.equal(s.tokenizer.remote, 'https://hf.example/r/resolve/main/tokenizer.json');
+});
+check('an explicit tokenizerUrl wins over the derived one', () => {
+  const s = resolveWeightSources(
+    {
+      modelFile: 'm.onnx',
+      weightsUrl: 'https://hf.example/r/resolve/main/m.onnx',
+      tokenizerUrl: 'https://other.example/tokenizer.json',
+    },
+    MODELS,
+  );
+  assert.equal(s.tokenizer.remote, 'https://other.example/tokenizer.json');
+});
+check('external weight data is resolved on both sides', () => {
+  const s = resolveWeightSources(
+    {
+      modelFile: 'm.onnx',
+      weightsDataFile: 'm.onnx_data',
+      weightsUrl: 'https://hf.example/r/resolve/main/m.onnx',
+    },
+    MODELS,
+  );
+  assert.equal(s.externalData.file, 'm.onnx_data');
+  assert.equal(s.externalData.local, `${MODELS}m.onnx_data`);
+  assert.equal(s.externalData.remote, 'https://hf.example/r/resolve/main/m.onnx_data');
+});
+check('a relative weightsUrl is rejected with the field named', () => {
+  assert.throws(
+    () => resolveWeightSources({ modelFile: 'm.onnx', weightsUrl: 'models/m.onnx' }, MODELS),
+    (e) => /weightsUrl must be an absolute URL/.test(e.message),
+  );
+});
+check('an http weightsUrl is rejected', () => {
+  assert.throws(
+    () => resolveWeightSources({ modelFile: 'm.onnx', weightsUrl: 'http://hf.example/m.onnx' }, MODELS),
+    (e) => /weightsUrl must be https/.test(e.message),
+  );
+});
+check('http on loopback is allowed, for a local weights host', () => {
+  const s = resolveWeightSources(
+    { modelFile: 'm.onnx', weightsUrl: 'http://127.0.0.1:4174/m.onnx' },
+    MODELS,
+  );
+  assert.equal(s.model.remote, 'http://127.0.0.1:4174/m.onnx');
+  assert.equal(s.tokenizer.remote, 'http://127.0.0.1:4174/tokenizer.json');
+});
+check('a missing modelFile is rejected', () => {
+  assert.throws(() => resolveWeightSources({}, MODELS), (e) => /modelFile is required/.test(e.message));
 });
 
 console.log(`\n${pass} checks passed`);

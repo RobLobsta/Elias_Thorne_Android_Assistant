@@ -18,17 +18,86 @@ section references below point back at it.
 | Self-improvement loop with pre-commit telemetry (§2.3) | working |
 | PWA shell, offline caching, TWA config (§3) | working |
 | Installable APK from GitHub Actions | working |
-| BitNet inference on WebGPU (§2.2) | needs weights — see below |
+| BitNet inference on WebGPU (§2.2) | working — needs weights, see below |
 
-The ONNX graph runner, tokenizer and sampler are implemented but cannot be
-exercised without a BitNet export, which is too large to commit. With no weights
-present Elias boots on a **fallback reasoner**: a deterministic, non-neural
-responder that emits the same action schema the real model does, so the wake
-word, telemetry, linter, sandbox and memory are all genuinely exercised end to
-end. The backend pill in the UI reads `fallback reasoner` when this is the case.
+A 2B parameter export is a gigabyte-class file. It cannot be committed, it
+cannot be served from a project Pages site (1 GB per site, 100 MB per file), and
+the APK is a Trusted Web Activity that carries no web assets at all — so the
+weights are never part of the build. There are two ways to supply them and one
+fallback:
 
-See [`public/models/README.md`](public/models/README.md) for what to drop in and
+1. **Build them in.** Drop the export into `public/models` before
+   `npm run build`. Needs a deployment that can serve a file that size.
+2. **Download them on demand.** Set `weightsUrl` in
+   `public/models/model-config.json` to an export on a CORS-enabled host, and
+   Elias offers the download from a banner in the UI. Nothing is fetched until
+   the user presses the button — a phone on mobile data must not lose a gigabyte
+   to an app starting up — and the bytes are kept in IndexedDB afterwards, so it
+   is a one-time cost that survives app updates. **This is the route that works
+   offline**, and the one to use for anything large.
+3. **Neither.** Elias boots on a **fallback reasoner**: a deterministic,
+   non-neural responder that emits the same action schema the real model does,
+   so the wake word, telemetry, linter, sandbox and memory are all genuinely
+   exercised end to end. The backend pill reads `fallback reasoner` and the
+   banner says why.
+
+Local files win over the remote source, and the build prints which of the three
+you are shipping.
+
+See [`public/models/README.md`](public/models/README.md) for the config keys and
 how to make `model-config.json` match your export.
+
+### It does not have to be BitNet
+
+There is no official BitNet 2B4T ONNX export — Microsoft publishes safetensors
+and GGUF only — so `weightsUrl` ships empty. But the graph runner is not
+BitNet-specific: it introspects whatever decoder-only ONNX you give it. The
+exports under Hugging Face's [`onnx-community`](https://huggingface.co/onnx-community)
+org already match what it expects, and they come in browser-sized
+quantisations.
+
+This was verified end to end with SmolLM2-360M-Instruct (`q4f16`, 261 MB):
+
+```json
+{
+  "modelFile": "model.onnx",
+  "weightsUrl": "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/onnx/model_q4f16.onnx",
+  "tokenizerUrl": "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer.json",
+  "numHiddenLayers": 32,
+  "numKeyValueHeads": 5,
+  "headDim": 64,
+  "template": {
+    "bos": "",
+    "system": "<|im_start|>system\n{content}<|im_end|>\n",
+    "user": "<|im_start|>user\n{content}<|im_end|>\n",
+    "assistant": "<|im_start|>assistant\n{content}<|im_end|>\n",
+    "generationPrefix": "<|im_start|>assistant\n",
+    "stopTokens": ["<|im_end|>", "<|endoftext|>"]
+  }
+}
+```
+
+Note the `template` block: SmolLM2 is ChatML, not Llama-3. Swapping those four
+strings is the whole of what a differently-templated model needs.
+
+**Offline.** Once the weights are stored, the app needs no network at all.
+Verified by installing the 261 MB model, killing both the app's origin and the
+weights host, switching the browser to offline mode, reloading, and still
+getting a generated reply on the WASM backend.
+
+**Storage.** Downloaded weights go to IndexedDB rather than Cache Storage,
+because Chromium refuses a single Cache entry past roughly 200 MB — 192 MB
+stored, 256 MB failed with an opaque `UnknownError` *after* writing the bytes.
+IndexedDB took 320 MB without complaint. Budget for the origin quota too: this
+environment offered ~1 GB, which a 2B model would not fit inside.
+
+**Speed.** That run took ~50 s per reply on four desktop cores, because ONNX
+Runtime fell back to single-threaded WASM. WASM threads need
+`crossOriginIsolated`, which needs COOP/COEP response headers, which GitHub
+Pages cannot set. On a handset the path that matters is WebGPU — which Chrome
+on Android has, and which the engine prefers when present — but that was not
+measurable in this environment, since it has no GPU. Treat the CPU number as a
+floor, not as what a phone will do.
 
 ## Quick start
 
@@ -55,7 +124,7 @@ public/
   manifest.json                PWA descriptors
   sw.js                        offline shell + weight caching
   icons/                       generated PWA/launcher icons
-  models/                      BitNet weights + tokenizer (gitignored)
+  models/                      model-config.json; weights + tokenizer if bundled (gitignored)
   ort/                         staged ONNX Runtime binaries (gitignored)
 src/
   main.js                      UI orchestrator, audio state machine, TTS
@@ -69,6 +138,7 @@ src/
     persona.js                 identity lock, wake anchors, system persona
     schema.js                  action schema, message contracts, allow-lists
     tokenizer.js               byte-level BPE + chat templating
+    weights.js                 where the weights live, and fetching them
 scripts/
   check.mjs                    logic checks (npm test)
   generate-icons.mjs           icon generation (npm run icons)
@@ -281,8 +351,9 @@ inference path — is unaffected, but the ONNX WASM fallback loses
 
 ## Verifying
 
-`npm test` runs 22 dependency-free checks over the wake anchors, the
-interruption gate, the persona identity lock and the action schema.
+`npm test` runs 30 dependency-free checks over the wake anchors, the
+interruption gate, the persona identity lock, the action schema and the
+resolution of weight sources.
 
 Worker-level behaviour was verified by driving the built app in Chromium. If you
 want to reproduce it, install `playwright` and script these against
@@ -293,6 +364,18 @@ want to reproduce it, install `playwright` and script these against
   a sandbox log from inside the tool, and the answer "That comes to 47 across 3
   values."
 - **Persistence.** Reload. The tool and the memories survive.
+- **Offline operation.** Weights installed, both origins killed, browser set
+  offline, page reloaded: still `BitNet · WASM`, still generating. The only
+  requests that fail are the local `models/` probes, which are meant to.
+- **Weight provisioning.** Verified in Chromium against a purpose-built tiny
+  decoder ONNX graph (`input_ids` + `attention_mask` + `position_ids`, two KV
+  layers, a `logits` head) served from a second origin. All four cases: weights
+  bundled in `public/models`; a remote `weightsUrl` offered, downloaded with
+  progress, compiled, and still cached after a reload; the same with external
+  weight data in a sidecar file; and neither, falling back with the banner
+  explaining why. Plus the failure paths — a corrupt graph and a missing sidecar
+  both surface a readable message, keep Elias on the fallback reasoner, and
+  evict the bad cache entry so Retry starts clean.
 - **Sandbox.** Bind a `MessageChannel` to `sandbox.worker.js` directly and check
   that lint rejects `globalThis` and bare `fetch` and reports syntax errors;
   that a failing spec fails the run; that `ctx.fetch` to a non-allow-listed host
@@ -317,9 +400,13 @@ the same commands, but the first Actions run is still the first Actions run.
 
 ## Known limitations
 
-- **Weights.** See Status. The graph runner adapts to the common
-  `past_key_values.N.key` / `present.N.key` conventions and to optional
-  `attention_mask` / `position_ids`, but no specific export has been run.
+- **Weights.** See Status. The graph runner has now been run against a real
+  instruct model (SmolLM2-360M, `q4f16`) as well as synthetic float32 and
+  float16 graphs. No *BitNet* export has been through it, because none exists in
+  ONNX — so `weightsUrl` ships empty and the headline claim of a ternary model
+  on WebGPU is still unproven. Note also that ONNX Runtime Web has no ternary
+  kernel: an ONNX BitNet would be stored and executed densely, so it would carry
+  the size and the cost of any other 2B model.
 - **Wake word cost.** Continuous `SpeechRecognition` on Android is
   network-backed and battery-hungry, and the platform ends sessions on its own
   schedule (there is a restart supervisor with backoff). A real always-on wake

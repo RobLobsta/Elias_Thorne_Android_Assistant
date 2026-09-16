@@ -14,13 +14,26 @@
  */
 
 const DB_NAME = 'elias-thorne';
-const DB_VERSION = 1;
+// v2 added the weights store. onupgradeneeded creates whatever is missing, so
+// an existing database gains it without losing memories or tools.
+const DB_VERSION = 2;
 
-/** Object stores: conversational state, Orama snapshots, the tool registry. */
+/**
+ * Object stores: conversational state, Orama snapshots, the tool registry, and
+ * the model weights.
+ *
+ * Weights live here rather than in Cache Storage, which would be the obvious
+ * home for them, because Chromium refuses a single Cache entry past roughly
+ * 200 MB — measured on this project: 192 MB stored, 256 MB failed with an
+ * opaque "UnknownError" having already written the bytes. IndexedDB took the
+ * same payloads and larger without complaint. Every model worth running is
+ * bigger than that ceiling.
+ */
 export const STORES = Object.freeze({
   STATE: 'state',
   MEMORY: 'memory',
   TOOLS: 'tools',
+  WEIGHTS: 'weights',
 });
 
 let dbPromise = null;

@@ -132,6 +132,35 @@ jobs:
           fi
           cat "$HOME/.bubblewrap/config.json"
 
+      - name: Point every SDK variable at Bubblewrap's SDK
+        run: |
+          # The runner image ships its own Android SDK and exports both
+          # ANDROID_HOME and ANDROID_SDK_ROOT pointing at it. Bubblewrap then
+          # overrides ANDROID_HOME alone when it shells out to Gradle, so the
+          # two disagree and AGP's SdkLocator refuses to guess:
+          #
+          #   Several environment variables and/or system properties contain
+          #   different paths to the SDK.
+          #     ANDROID_HOME:     /home/runner/.bubblewrap/android_sdk
+          #     ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          #
+          # It surfaces as "Could not determine the dependencies of task
+          # ':app:minifyReleaseWithR8'", which is misleading — R8 is simply the
+          # first task to ask where the SDK is. Overriding both here, for every
+          # later step, leaves exactly one answer. Bubblewrap's SDK is the one
+          # to keep: it is what its Gradle invocation uses regardless, and the
+          # licence-acceptance step below has already been applied to it.
+          SDK=$(node -p "require('$HOME/.bubblewrap/config.json').androidSdkPath")
+          if [ ! -d "$SDK" ]; then
+            echo "Bubblewrap reported an Android SDK at $SDK, which does not exist." >&2
+            exit 1
+          fi
+          {
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+          } >> "$GITHUB_ENV"
+          echo "Android SDK pinned to $SDK"
+
       - name: Accept Android SDK licences
         run: |
           # Without this, Gradle skips build-tools and then dies at
@@ -260,7 +289,12 @@ jobs:
           cd build/twa
           # `yes` covers any residual SDK component licence prompt; the
           # passwords come from the environment, so nothing else is asked.
-          yes | bubblewrap build --skipPwaValidation
+          #
+          # Fed by process substitution rather than `yes | bubblewrap`, so the
+          # step's exit status is the build's alone. As a pipeline it also
+          # printed "yes: standard output: Broken pipe" on the line after the
+          # real error, which reads like a cause and is not one.
+          bubblewrap build --skipPwaValidation < <(yes)
           ls -la ./*.apk ./*.aab 2>/dev/null || true
 
       - name: Emit the Digital Asset Links file

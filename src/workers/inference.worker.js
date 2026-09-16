@@ -33,6 +33,14 @@ import {
   IdleAutosaver,
 } from '../utils/storage.js';
 import { BpeTokenizer, applyChatTemplate, DEFAULT_CHAT_TEMPLATE } from '../utils/tokenizer.js';
+import {
+  resolveWeightSources,
+  probeLocal,
+  probeStored,
+  probeRemoteSize,
+  download,
+  evict,
+} from '../utils/weights.js';
 
 /** Dimensionality of the local hashing embedding used for vector recall. */
 const EMBED_DIMS = 256;
@@ -55,6 +63,15 @@ const MODELS_BASE = new URL('models/', APP_BASE);
  * them in public/models/model-config.json to match your own ONNX export. */
 const DEFAULT_MODEL_CONFIG = Object.freeze({
   modelFile: 'bitnet-2b4t.onnx',
+  // Where the weights come from when they were not built into the app. Empty
+  // by default: there is no canonical BitNet ONNX export to point at, and
+  // guessing a URL would be worse than saying so. See public/models/README.md.
+  weightsUrl: '',
+  weightsDataFile: '',
+  weightsDataUrl: '',
+  tokenizerUrl: '',
+  /** Declared download size, used only when the host refuses a HEAD request. */
+  weightsSizeBytes: 0,
   numHiddenLayers: 30,
   numKeyValueHeads: 5,
   headDim: 128,
@@ -77,6 +94,7 @@ const state = {
   generating: false,
   abort: false,
   backend: 'unavailable',
+  weights: { survey: null, installing: false, controller: null, persisted: false },
 };
 
 /* ------------------------------------------------------------- UI messaging */
@@ -416,6 +434,10 @@ class BitNetEngine {
   #wantsAttentionMask = false;
   #wantsPositionIds = false;
   #stopIds = new Set();
+  /** KV cache dtype and per-head shape, read off the graph in #introspect. */
+  #cacheType = null;
+  #cacheHeads = null;
+  #cacheHeadDim = null;
 
   constructor({ session, tokenizer, config, backend }) {
     this.#session = session;
@@ -429,26 +451,22 @@ class BitNetEngine {
     return this.#tokenizer;
   }
 
-  static async create(config, { onProgress } = {}) {
+  /**
+   * @param {object} config Merged model config.
+   * @param {{ model: string|Uint8Array, externalData: {path: string, data: Uint8Array}|null,
+   *          tokenizerBytes: Uint8Array }} assets Already-provisioned weights, from
+   *   {@link provisionWeights}. Locating and downloading them is deliberately
+   *   not this class's job: it must not be able to start a gigabyte-sized
+   *   transfer as a side effect of being constructed.
+   */
+  static async create(config, assets, { onProgress } = {}) {
     const ort = await loadOrt();
     ort.env.wasm.wasmPaths = ORT_BASE;
     ort.env.wasm.numThreads = Math.min(navigator.hardwareConcurrency ?? 4, 4);
     ort.env.logLevel = 'warning';
 
-    const modelUrl = new URL(config.modelFile, MODELS_BASE).toString();
-    const head = await fetch(modelUrl, { method: 'HEAD' }).catch(() => null);
-    if (!head?.ok) {
-      throw new Error(`No BitNet weights at ${modelUrl} (HTTP ${head?.status ?? 'unreachable'}).`);
-    }
-    // A dev server's SPA fallback answers 200 with index.html for a missing
-    // file, which otherwise surfaces much later as an opaque JSON parse error.
-    const contentType = head.headers.get('content-type') ?? '';
-    if (contentType.includes('text/html')) {
-      throw new Error(`No BitNet weights at ${modelUrl} — the server returned HTML.`);
-    }
-
     onProgress?.('loading tokenizer');
-    const tokenizer = await BpeTokenizer.load(MODELS_BASE);
+    const tokenizer = BpeTokenizer.fromBytes(assets.tokenizerBytes);
 
     onProgress?.('compiling graph for WebGPU');
     const providers = [];
@@ -460,11 +478,20 @@ class BitNetEngine {
     let lastError = null;
     for (const provider of providers) {
       try {
-        session = await ort.InferenceSession.create(modelUrl, {
+        const options = {
           executionProviders: [provider],
           graphOptimizationLevel: 'all',
           enableMemPattern: provider === 'wasm',
-        });
+        };
+        // An export over the 2 GB protobuf limit keeps its tensors in a sidecar
+        // file. On the web nothing resolves that path for us, so the bytes are
+        // handed over explicitly under the name the graph refers to.
+        if (assets.externalData) {
+          options.externalData = [
+            { path: assets.externalData.path, data: assets.externalData.data },
+          ];
+        }
+        session = await ort.InferenceSession.create(assets.model, options);
         backend = provider;
         break;
       } catch (error) {
@@ -483,6 +510,17 @@ class BitNetEngine {
     this.#wantsAttentionMask = inputs.includes('attention_mask');
     this.#wantsPositionIds = inputs.includes('position_ids');
 
+    // The graph declares the cache's dtype and per-head shape; the config's
+    // numKeyValueHeads / headDim are only a fallback for an export that leaves
+    // them symbolic. Trusting the config over the graph is how a float16 export
+    // — which is what almost every browser-targeted quantisation is — gets fed
+    // a float32 cache and dies on a type mismatch at the first run.
+    const metadata = new Map(
+      (this.#session.inputMetadata ?? [])
+        .filter((entry) => entry.isTensor)
+        .map((entry) => [entry.name, entry]),
+    );
+
     const pastPattern = /^past_key_values\.(\d+)\.(key|value)$/;
     const layers = new Map();
     for (const name of inputs) {
@@ -492,6 +530,14 @@ class BitNetEngine {
       const entry = layers.get(index) ?? {};
       entry[match[2]] = name;
       layers.set(index, entry);
+
+      const meta = metadata.get(name);
+      if (!meta) continue;
+      this.#cacheType ??= meta.type;
+      // [batch, kvHeads, pastSequence, headDim] — take whichever of the two
+      // head dimensions the exporter pinned to a number.
+      if (typeof meta.shape?.[1] === 'number') this.#cacheHeads ??= meta.shape[1];
+      if (typeof meta.shape?.[3] === 'number') this.#cacheHeadDim ??= meta.shape[3];
     }
 
     for (const [index, entry] of [...layers.entries()].sort((a, b) => a[0] - b[0])) {
@@ -571,11 +617,12 @@ class BitNetEngine {
   }
 
   #emptyCache(ort) {
-    const { numKeyValueHeads, headDim } = this.#config;
+    const type = this.#cacheType ?? 'float32';
+    const heads = this.#cacheHeads ?? this.#config.numKeyValueHeads;
+    const headDim = this.#cacheHeadDim ?? this.#config.headDim;
     const cache = {};
     for (const layer of this.#kvLayers) {
-      const empty = () =>
-        new ort.Tensor('float32', new Float32Array(0), [1, numKeyValueHeads, 0, headDim]);
+      const empty = () => new ort.Tensor(type, emptyTensorData(type), [1, heads, 0, headDim]);
       cache[layer.pastKey] = empty();
       cache[layer.pastValue] = empty();
     }
@@ -625,13 +672,58 @@ class BitNetEngine {
     const data = tensor.data;
     const offset = (sequence - 1) * vocab;
     const slice = new Float32Array(vocab);
-    for (let i = 0; i < vocab; i += 1) slice[i] = Number(data[offset + i]);
+    // A float16 output arrives as raw bit patterns in a Uint16Array on any
+    // engine without Float16Array, where Number() would read the bits as an
+    // integer and the sampler would pick nonsense.
+    const packed = tensor.type === 'float16' && data instanceof Uint16Array;
+    for (let i = 0; i < vocab; i += 1) {
+      const value = data[offset + i];
+      slice[i] = packed ? float16ToNumber(value) : Number(value);
+    }
     return slice;
   }
 
   async dispose() {
     await this.#session.release?.();
   }
+}
+
+/**
+ * A zero-length backing array of the right kind for an ONNX dtype.
+ *
+ * ONNX Runtime checks the array kind against the declared type even when the
+ * tensor holds nothing, so the empty KV cache fed on the first step still has
+ * to be built out of the right one.
+ */
+function emptyTensorData(type) {
+  switch (type) {
+    case 'float16':
+      // No universal typed array for half floats: ORT takes Float16Array where
+      // the engine has it and a Uint16Array of raw bits everywhere else.
+      return typeof Float16Array === 'function' ? new Float16Array(0) : new Uint16Array(0);
+    case 'float64':
+      return new Float64Array(0);
+    case 'int64':
+      return new BigInt64Array(0);
+    case 'int32':
+      return new Int32Array(0);
+    case 'int8':
+      return new Int8Array(0);
+    case 'uint8':
+      return new Uint8Array(0);
+    default:
+      return new Float32Array(0);
+  }
+}
+
+/** Decode an IEEE-754 half-precision bit pattern. */
+function float16ToNumber(bits) {
+  const sign = bits & 0x8000 ? -1 : 1;
+  const exponent = (bits >> 10) & 0x1f;
+  const fraction = bits & 0x03ff;
+  if (exponent === 0) return sign * fraction * 2 ** -24;
+  if (exponent === 0x1f) return fraction ? NaN : sign * Infinity;
+  return sign * (fraction + 1024) * 2 ** (exponent - 25);
 }
 
 /** Temperature / top-k / top-p sampling with a repetition penalty. */
@@ -765,7 +857,7 @@ class HeuristicEngine {
         : 'I have no tools yet. Ask me to build one and I will write it.';
     }
 
-    return `My weights are not loaded, so I am running on my fallback reasoner. Drop a BitNet export into public/models and I will think properly. You said: "${input}".`;
+    return `My weights are not loaded, so I am running on my fallback reasoner. Install them from the banner at the top, or drop a BitNet export into public/models before building, and I will think properly. You said: "${input}".`;
   }
 
   /**
@@ -1090,6 +1182,199 @@ async function applyAction(action) {
   }
 }
 
+/* ------------------------------------------------------ weight provisioning */
+
+/** Where the weights stand, in the order the boot path prefers them. */
+const WEIGHTS = Object.freeze({
+  /** Served by the app itself — someone put an export in public/models. */
+  LOCAL: 'local',
+  /** Downloaded on an earlier run and still in Cache Storage. */
+  CACHED: 'cached',
+  /** A remote source is configured; nothing has been fetched yet. */
+  DOWNLOADABLE: 'downloadable',
+  /** Nowhere to get them. */
+  ABSENT: 'absent',
+});
+
+/**
+ * Find out where the weights stand without moving any real data.
+ *
+ * Boot has to answer "can Elias think?" in a second or two, and the honest
+ * answer often costs a gigabyte to act on. So this only ever issues HEAD
+ * requests and cache lookups; the decision to spend the download is the user's,
+ * and is taken later via WEIGHTS_INSTALL.
+ */
+async function surveyWeights(config) {
+  const sources = resolveWeightSources(config, MODELS_BASE);
+
+  if ((await probeLocal(sources.model.local)).ok) {
+    return { kind: WEIGHTS.LOCAL, sources, bytes: 0 };
+  }
+
+  if (!sources.model.remote) {
+    return { kind: WEIGHTS.ABSENT, sources, bytes: 0 };
+  }
+
+  const cached = await probeStored(sources.model.remote);
+  if (cached.ok) return { kind: WEIGHTS.CACHED, sources, bytes: cached.bytes };
+
+  const bytes = (await probeRemoteSize(sources.model.remote)) || config.weightsSizeBytes || 0;
+  return { kind: WEIGHTS.DOWNLOADABLE, sources, bytes };
+}
+
+/**
+ * Obtain one file, preferring whatever costs nothing.
+ *
+ * `allowNetwork` is the gate: with it false this will happily read a local or
+ * already-cached copy but refuses to start a transfer, which is what keeps boot
+ * from quietly eating someone's data allowance.
+ */
+async function acquire(source, { what, allowNetwork, onProgress, signal, expectedBytes = 0 }) {
+  if ((await probeLocal(source.local)).ok) {
+    const response = await fetch(source.local, { signal });
+    if (!response.ok) throw new Error(`${what} unreadable (HTTP ${response.status}).`);
+    // Served by the app, so the service worker's cache-first rule keeps it;
+    // nothing for this function to persist.
+    return { bytes: new Uint8Array(await response.arrayBuffer()), cached: true };
+  }
+
+  if (!source.remote) {
+    throw new Error(`No ${what} at ${source.local}, and model-config.json names no remote source.`);
+  }
+  if (!allowNetwork && !(await probeStored(source.remote)).ok) {
+    throw new Error(`${what} has not been downloaded yet.`);
+  }
+  return download(source.remote, { onProgress, signal, expectedBytes });
+}
+
+/**
+ * Turn a survey into something {@link BitNetEngine.create} can load.
+ *
+ * A local export is handed over as a URL rather than as bytes: ONNX Runtime
+ * streams it and the service worker caches it, so the file is never resident
+ * twice. Anything remote has to be materialised, because the service worker
+ * deliberately passes cross-origin requests straight through.
+ */
+async function provisionWeights(survey, { allowNetwork = false, onProgress, signal } = {}) {
+  const { sources } = survey;
+  const shared = { allowNetwork, signal };
+
+  const tokenizer = await acquire(sources.tokenizer, { what: 'tokenizer.json', ...shared });
+
+  const external = sources.externalData
+    ? await acquire(sources.externalData, { what: 'external weight data', ...shared })
+    : null;
+  const externalData = external
+    ? { path: sources.externalData.file, data: external.bytes }
+    : null;
+
+  if (survey.kind === WEIGHTS.LOCAL) {
+    return {
+      model: sources.model.local,
+      externalData,
+      tokenizerBytes: tokenizer.bytes,
+      persisted: true,
+    };
+  }
+
+  const model = await acquire(sources.model, {
+    what: 'BitNet weights',
+    ...shared,
+    onProgress,
+    expectedBytes: survey.bytes,
+  });
+
+  return {
+    model: model.bytes,
+    externalData,
+    tokenizerBytes: tokenizer.bytes,
+    // Every piece has to have stuck for the next boot to skip the network.
+    persisted: model.cached && tokenizer.cached && (external ? external.cached : true),
+  };
+}
+
+/** Tell the UI thread what it may offer the user. */
+function postWeightsStatus(extra = {}) {
+  const survey = state.weights.survey;
+  post(MESSAGE.STATUS, {
+    stage: 'weights',
+    detail: {
+      kind: survey?.kind ?? WEIGHTS.ABSENT,
+      bytes: survey?.bytes ?? 0,
+      url: survey?.sources?.model?.remote ?? null,
+      installing: state.weights.installing,
+      ...extra,
+    },
+  });
+}
+
+/**
+ * Download the weights and swap the fallback reasoner out for the real thing.
+ *
+ * Only ever reached from an explicit user action on the UI thread.
+ */
+async function installWeights() {
+  if (state.weights.installing) return;
+  if (state.generating) {
+    post(MESSAGE.ERROR, { message: 'Elias is mid-thought — wait for him to finish first.' });
+    return;
+  }
+  const survey = state.weights.survey;
+  if (!survey || survey.kind === WEIGHTS.ABSENT) {
+    post(MESSAGE.ERROR, {
+      message: 'No weights source is configured. See public/models/README.md.',
+      context: 'weights',
+    });
+    return;
+  }
+
+  state.weights.installing = true;
+  state.weights.controller = new AbortController();
+  postWeightsStatus({ received: 0, total: survey.bytes });
+  telemetry(`Downloading BitNet weights from ${survey.sources.model.remote}.`, { channel: 'system' });
+
+  try {
+    const assets = await provisionWeights(survey, {
+      allowNetwork: true,
+      signal: state.weights.controller.signal,
+      onProgress: (received, total) => postWeightsStatus({ received, total }),
+    });
+
+    status('boot', 'compiling graph');
+    state.engine = await BitNetEngine.create(state.config, assets, {
+      onProgress: (detail) => status('boot', detail),
+    });
+    state.backend = state.engine.backend;
+    // Only claim CACHED if the bytes actually stuck; otherwise the next boot
+    // would look for a cache entry that is not there and offer nothing.
+    state.weights.survey = {
+      ...survey,
+      kind: assets.persisted ? WEIGHTS.CACHED : WEIGHTS.DOWNLOADABLE,
+    };
+    state.weights.installing = false;
+    postWeightsStatus({ installed: true, persisted: assets.persisted });
+    telemetry(
+      assets.persisted
+        ? `Weights installed and kept on the device — now thinking on ${state.backend}.`
+        : `Weights loaded on ${state.backend}, but the device refused to store them ` +
+            `(out of quota). They will have to be downloaded again next time.`,
+      { channel: 'system' },
+    );
+    post(MESSAGE.STATUS, { stage: 'online', detail: await onlineDetail() });
+  } catch (error) {
+    state.weights.installing = false;
+    // A half-written or corrupt entry would be served happily on the next boot
+    // and fail somewhere far less obvious, so drop it and let them retry.
+    await evict([
+      survey.sources.model.remote,
+      survey.sources.externalData?.remote,
+      survey.sources.tokenizer.remote,
+    ]);
+    postWeightsStatus({ failed: error.name === 'AbortError' ? 'cancelled' : error.message });
+    if (error.name !== 'AbortError') fail(error, 'weights');
+  }
+}
+
 /* --------------------------------------------------------------- lifecycle */
 
 async function loadModelConfig() {
@@ -1117,9 +1402,33 @@ async function boot() {
   state.tools = await ToolRegistry.open();
   post(MESSAGE.TOOLS, { tools: state.tools.list() });
 
+  status('boot', 'locating weights');
+  try {
+    state.weights.survey = await surveyWeights(state.config);
+  } catch (error) {
+    // A malformed weights config must not cost the user the rest of the agent.
+    state.weights.survey = null;
+    fail(error, 'weights');
+  }
+  state.weights.persisted = lock.persisted;
+  postWeightsStatus();
+
+  const survey = state.weights.survey;
+  const loadable = survey?.kind === WEIGHTS.LOCAL || survey?.kind === WEIGHTS.CACHED;
+
   status('boot', 'starting inference engine');
   try {
-    state.engine = await BitNetEngine.create(state.config, {
+    if (!loadable) {
+      throw new Error(
+        survey?.kind === WEIGHTS.DOWNLOADABLE
+          ? 'weights are available but have not been downloaded on this device yet'
+          : 'no weights are present and model-config.json names no source for them',
+      );
+    }
+    const assets = await provisionWeights(survey, {
+      onProgress: (received, total) => postWeightsStatus({ received, total }),
+    });
+    state.engine = await BitNetEngine.create(state.config, assets, {
       onProgress: (detail) => status('boot', detail),
     });
     state.backend = state.engine.backend;
@@ -1133,17 +1442,31 @@ async function boot() {
       degraded: true,
       reason: error.message,
     });
+    // A cached copy that will not load — truncated, or with its tokenizer
+    // evicted out from under it — would otherwise leave the banner silent and
+    // the user with no way to try again. Drop it and offer the download afresh;
+    // without the eviction the retry would just re-read the same bad bytes.
+    if (survey?.kind === WEIGHTS.CACHED) {
+      await evict([
+        survey.sources.model.remote,
+        survey.sources.externalData?.remote,
+        survey.sources.tokenizer.remote,
+      ]);
+      state.weights.survey = { ...survey, kind: WEIGHTS.DOWNLOADABLE };
+      postWeightsStatus({ failed: error.message });
+    }
   }
 
-  post(MESSAGE.STATUS, {
-    stage: 'online',
-    detail: {
-      backend: state.backend,
-      memories: await state.memory.size(),
-      tools: state.tools.names(),
-      persisted: lock.persisted,
-    },
-  });
+  post(MESSAGE.STATUS, { stage: 'online', detail: await onlineDetail() });
+}
+
+async function onlineDetail() {
+  return {
+    backend: state.backend,
+    memories: await state.memory.size(),
+    tools: state.tools.names(),
+    persisted: state.weights.persisted,
+  };
 }
 
 self.addEventListener('message', async (event) => {
@@ -1165,6 +1488,14 @@ self.addEventListener('message', async (event) => {
 
       case MESSAGE.CANCEL:
         state.abort = true;
+        return;
+
+      case MESSAGE.WEIGHTS_INSTALL:
+        await installWeights();
+        return;
+
+      case MESSAGE.WEIGHTS_CANCEL:
+        state.weights.controller?.abort();
         return;
 
       case MESSAGE.MEMORY_SEARCH:

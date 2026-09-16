@@ -10,6 +10,12 @@
  *     revalidated. These are hundreds of megabytes and immutable for a given
  *     filename; re-checking them on every boot would burn the user's data.
  *
+ * One limit worth knowing about: Chromium refuses a single Cache entry past
+ * roughly 200 MB. That only bites weights *bundled* into public/models, which
+ * would then be re-fetched from the server on every boot and would not work
+ * offline. Downloaded weights do not come through here at all — utils/weights.js
+ * keeps those in IndexedDB, which has no such ceiling.
+ *
  * Cross-origin requests (the sandbox's ESM imports, tool fetches) are passed
  * straight through. They are throttled and allow-listed in Worker B, and
  * caching third-party code here would quietly extend its lifetime.

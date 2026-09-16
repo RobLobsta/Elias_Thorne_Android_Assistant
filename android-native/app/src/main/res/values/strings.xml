@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">Elias Thorne</string>
+    <string name="action_talk">Talk</string>
+    <string name="action_stop">Stop</string>
+    <string name="action_send">Send</string>
+    <string name="action_model">Choose model…</string>
+    <string name="hint_input">Ask Elias something</string>
+
+    <string name="status_no_model">No model installed</string>
+    <string name="status_importing">Importing…</string>
+    <string name="status_import_failed">Import failed: %1$s</string>
+    <string name="status_loading">Loading %1$s…</string>
+    <string name="status_load_failed">Could not load the model: %1$s</string>
+    <string name="status_ready">Ready — BitNet on %1$d threads, offline</string>
+    <string name="status_ready_short">Ready</string>
+    <string name="status_thinking">Thinking…</string>
+    <string name="status_listening">Listening…</string>
+    <string name="status_heard">“%1$s”</string>
+    <string name="status_stopped">Stopped</string>
+    <string name="status_spoke">%1$d tokens · %2$.1f s · %3$.1f tok/s</string>
+
+    <string name="hint_no_model">Choose a GGUF model file to begin. Nothing leaves the device.</string>
+    <string name="hint_ready">Say something, or type. Everything runs on this phone.</string>
+    <string name="hint_no_recognizer">No speech recogniser on this device — typing still works.</string>
+</resources>
