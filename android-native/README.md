@@ -110,6 +110,45 @@ clang++ -O2 -std=c++17 -o elias-test \
 ./elias-test model.gguf "What is the capital of France?"
 ```
 
+## If it is slow
+
+Two build settings dominate throughput, and both defaulted the wrong way:
+
+- **The Android Gradle plugin compiles a debug variant's native code at `-O0`.**
+  `cppFlags += "-O3"` in `build.gradle.kts` applies only to the app's own two
+  source files, not to the ggml subproject where all the arithmetic is. This
+  measured **0.3 tok/s on device**. The CMakeLists now appends `-O3 -DNDEBUG` to
+  the debug flags, which has to be done by appending to the *normal* variable:
+  the NDK toolchain sets `CMAKE_C_FLAGS_DEBUG` at `project()` time, and a normal
+  variable shadows the cache, so forcing it into the cache is silently ignored.
+- **No `-march`.** Cross-compiling leaves `GGML_NATIVE` off, and with no
+  `GGML_CPU_ARM_ARCH` ggml adds no architecture flag at all — so the build
+  targets baseline `armv8-a` and the quantised dot products take the scalar
+  path. Now `armv8.2-a+dotprod+fp16`.
+
+Check what a build actually used rather than assuming:
+
+```bash
+python3 - app/.cxx/Debug/*/arm64-v8a/compile_commands.json <<'EOF'
+import json,sys
+for c in json.load(open(sys.argv[1])):
+    if c['file'].endswith('ggml-cpu.c'):
+        print([t for t in c['command'].split() if t.startswith(('-O','-march'))])
+EOF
+# expect: ['-O3', '-DNDEBUG', '-march=armv8.2-a+dotprod+fp16']
+```
+
+`+dotprod` needs ARMv8.2, which means roughly a 2018-or-later chip. On anything
+older the app dies immediately with `SIGILL`. Rebuild for the baseline if so:
+
+```bash
+./gradlew :app:assembleDebug -PeliasArmArch=armv8-a
+```
+
+Threads are set to `cores - 1`, capped at 6. On a big.LITTLE phone that includes
+the little cores, which can be slower than using the big ones alone — worth
+trying 4 if throughput disappoints.
+
 ## If it crashes
 
 Get the native stack, which is the only thing that identifies the cause:

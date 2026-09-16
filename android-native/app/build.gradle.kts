@@ -23,8 +23,13 @@ android {
         }
         externalNativeBuild {
             cmake {
-                arguments += listOf("-DANDROID_STL=c++_shared")
-                cppFlags += "-O3"
+                // eliasArmArch can be lowered to armv8-a for pre-2018 chips.
+                val armArch = (project.findProperty("eliasArmArch") as String?)
+                    ?: "armv8.2-a+dotprod+fp16"
+                arguments += listOf(
+                    "-DANDROID_STL=c++_shared",
+                    "-DELIAS_ARM_ARCH=$armArch",
+                )
             }
         }
     }

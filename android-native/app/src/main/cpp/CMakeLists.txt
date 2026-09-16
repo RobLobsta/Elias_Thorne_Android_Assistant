@@ -12,6 +12,37 @@ if(NOT EXISTS "${BITNET_DIR}/CMakeLists.txt")
         "Run: git submodule update --init --recursive")
 endif()
 
+# Optimise the native code in every APK variant.
+#
+# The Android Gradle plugin compiles a debug variant's native code with
+# CMAKE_BUILD_TYPE=Debug, which for ggml means -O0 and live assertions. For a
+# model runtime that is not "a bit slower": it measured 0.3 tok/s on device.
+# Debug info is kept, so this stays as debuggable as before — only the
+# optimiser is turned back on.
+# Appended as plain variables rather than forced into the cache: the NDK
+# toolchain file sets these as normal variables at project() time, and a normal
+# variable shadows the cache entry, so a FORCE here is silently ignored. This
+# keeps the NDK's own debug flags and adds the optimiser back.
+foreach(lang C CXX)
+    set(CMAKE_${lang}_FLAGS_DEBUG          "${CMAKE_${lang}_FLAGS_DEBUG} -O3 -DNDEBUG")
+    set(CMAKE_${lang}_FLAGS_RELWITHDEBINFO "${CMAKE_${lang}_FLAGS_RELWITHDEBINFO} -O3 -DNDEBUG")
+endforeach()
+message(STATUS "elias: C debug flags = ${CMAKE_C_FLAGS_DEBUG}")
+
+# ARM CPU features.
+#
+# Cross-compiling leaves GGML_NATIVE off, and without GGML_CPU_ARM_ARCH ggml
+# adds no -march at all — so the build targets baseline armv8-a and the
+# quantised dot products take the scalar path. armv8.2-a+dotprod+fp16 is the
+# floor for anything built after about 2018 and is where most of the speed is.
+# Override with -PeliasArmArch=armv8-a if the app dies instantly with SIGILL on
+# an older chip; see the README.
+if(NOT DEFINED ELIAS_ARM_ARCH)
+    set(ELIAS_ARM_ARCH "armv8.2-a+dotprod+fp16")
+endif()
+set(GGML_CPU_ARM_ARCH "${ELIAS_ARM_ARCH}" CACHE STRING "" FORCE)
+message(STATUS "elias: targeting ${ELIAS_ARM_ARCH}")
+
 # Static everything. The NDK links shared libraries with --no-undefined, and
 # ggml-base references the I2_S kernels that live over in ggml-cpu, so a shared
 # split fails to link. One static blob inside libelias.so is what we want on
