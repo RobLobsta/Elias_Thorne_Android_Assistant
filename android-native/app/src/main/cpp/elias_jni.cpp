@@ -7,8 +7,15 @@
 #include <android/log.h>
 #include <jni.h>
 
+#include <cstdio>
 #include <string>
 #include <vector>
+
+// Stamped at build time so a report can never be ambiguous about which APK
+// produced it. Overridden from CMake.
+#ifndef ELIAS_BUILD_STAMP
+#define ELIAS_BUILD_STAMP "unstamped"
+#endif
 
 #define LOG_TAG "elias-native"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -79,6 +86,35 @@ Java_ai_eliasthorne_assistant_LlamaBridge_nativeFree(JNIEnv * /*env*/, jobject /
         delete s->model;
         delete s;
     }
+}
+
+/**
+ * One line of fact about how inference is actually running.
+ *
+ * Reported rather than assumed: whether the CPU features the build targeted are
+ * present at runtime, and — the number that matters — prompt evaluation and
+ * token generation timed separately. Prompt eval is compute-bound; generation
+ * re-reads the whole model per token and is memory-bound. If only the second is
+ * slow, the build is fine and the device cannot hold the weights.
+ */
+JNIEXPORT jstring JNICALL
+Java_ai_eliasthorne_assistant_LlamaBridge_nativeDiagnostics(JNIEnv * env, jobject /*thiz*/,
+                                                            jlong handle) {
+    auto * s = as_session(handle);
+    std::string out = "build " ELIAS_BUILD_STAMP "\n";
+    if (!s) {
+        out += "no model loaded\ncpu: " + elias::cpu_features();
+        return env->NewStringUTF(out.c_str());
+    }
+    const auto st = s->model->last_stats();
+    char line[512];
+    snprintf(line, sizeof(line),
+             "%s\nprompt %d tok @ %.1f tok/s\ngenerate %d tok @ %.2f tok/s",
+             s->model->describe().c_str(), st.n_prompt, st.prompt_tok_s(),
+             st.n_eval, st.eval_tok_s());
+    out += line;
+    LOGI("%s", out.c_str());
+    return env->NewStringUTF(out.c_str());
 }
 
 JNIEXPORT void JNICALL

@@ -52,6 +52,8 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
     private var generating: Job? = null
     private var cancelled: java.util.concurrent.atomic.AtomicBoolean? = null
     private var speaking = false
+    private var lastDiagnostics: String = ""
+
 
     private val pickModel = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { importModel(it) }
@@ -92,6 +94,16 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
         }
         modelButton.setOnClickListener { pickModel.launch(arrayOf("*/*")) }
 
+        // Long-press the status line to copy the diagnostics, so a report can be
+        // pasted somewhere useful without a cable.
+        status.setOnLongClickListener {
+            val text = lastDiagnostics.ifBlank { llama.diagnostics() }
+            val cb = getSystemService(android.content.ClipboardManager::class.java)
+            cb?.setPrimaryClip(android.content.ClipData.newPlainText("elias diagnostics", text))
+            android.widget.Toast.makeText(this, "Diagnostics copied", android.widget.Toast.LENGTH_SHORT).show()
+            true
+        }
+
         if (store.isInstalled) loadModel() else promptForModel()
     }
 
@@ -131,6 +143,31 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
         }
     }
 
+    /**
+     * Will this model stay in memory, or be re-read from flash on every token?
+     *
+     * llama.cpp maps the weights from the file, so they are evictable. Generation
+     * touches the entire model once per token, so if the device cannot keep it
+     * resident every token waits on flash. Measured on a desktop with the same
+     * code: 21.9 tok/s with the pages warm against 2.0 tok/s cold — and a phone
+     * short of memory is permanently cold. This is the single biggest factor in
+     * whether the app feels usable, so it is said out loud before the user waits
+     * three seconds a word to discover it.
+     */
+    private fun memoryVerdict(modelBytes: Long): String? {
+        val info = android.app.ActivityManager.MemoryInfo()
+        getSystemService(android.app.ActivityManager::class.java)?.getMemoryInfo(info) ?: return null
+        // Weights plus the KV cache and everything else the process needs.
+        val needed = modelBytes * 1.25
+        return if (needed > info.availMem) {
+            "This model is ${formatBytes(modelBytes)} but only ${formatBytes(info.availMem)} is free. " +
+                "It will be re-read from storage constantly and generation will be very slow. " +
+                "A model under about ${formatBytes((info.availMem / 1.25).toLong())} will be far faster."
+        } else {
+            null
+        }
+    }
+
     private fun loadModel() {
         setBusy(true)
         modelButton.visibility = View.GONE
@@ -146,9 +183,11 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
                 modelButton.visibility = View.VISIBLE
                 setBusy(false)
             } else {
-                status.text = getString(R.string.status_ready, threads)
+                val warning = memoryVerdict(store.installedBytes())
+                status.text = warning ?: getString(R.string.status_ready, threads)
+                if (warning != null) Log.w("elias", warning)
+                Log.i("elias", llama.diagnostics())
                 setBusy(false)
-                say(getString(R.string.hint_ready))
             }
         }
     }
@@ -205,9 +244,13 @@ class MainActivity : AppCompatActivity(), Voice.Listener {
             val partial = synchronized(replyLock) { reply.toString() }
             val spoken = full.ifBlank { partial }.trim()
             replaceLast("Elias", spoken.ifBlank { "…" })
-            status.text = getString(
-                R.string.status_spoke, tokens, seconds, if (seconds > 0) tokens / seconds else 0.0,
-            )
+            // Report the phase split, not one blended figure: it is the only
+            // thing that separates "built wrong" from "the device cannot keep
+            // the weights in memory".
+            val diag = llama.diagnostics()
+            Log.i("elias", diag)
+            status.text = diag.lineSequence().drop(1).joinToString(" · ")
+            lastDiagnostics = diag
             history += LlamaBridge.Message("assistant", spoken)
             trimHistory()
 

@@ -112,7 +112,30 @@ clang++ -O2 -std=c++17 -o elias-test \
 
 ## If it is slow
 
-Two build settings dominate throughput, and both defaulted the wrong way:
+**Start here: is the model small enough to stay in memory?** This dominates
+everything else, and it is the opposite of what the "Why native" section above
+implies. llama.cpp maps the weights from the file, which keeps resident memory
+low precisely *because* the kernel is free to drop those pages. Generation reads
+the whole model once per token, so on a device that is always short of memory
+every token waits on flash. Measured with identical code, model and machine,
+back to back:
+
+| Page cache | Prompt eval | Generation |
+| ---------- | ----------- | ---------- |
+| cold       | 2.7 tok/s   | **2.0 tok/s**  |
+| warm       | 106.3 tok/s | **21.9 tok/s** |
+
+A phone with 4 GB total never gets to stay warm with a 1.2 GB model, so it runs
+permanently in the top row. The same harness on a 469 MB model — small enough to
+stay resident — gives **46 tok/s**. That is the fix: pick a model that fits in
+free RAM, not one that merely loads.
+
+The app now measures free memory at load and says so plainly when the model is
+too big for the device. Long-press the status line to copy the full diagnostics.
+The number to look at is the split: if prompt evaluation is fast and only
+generation is slow, the build is fine and the device cannot hold the weights.
+
+Two build settings also matter, and both defaulted the wrong way:
 
 - **The Android Gradle plugin compiles a debug variant's native code at `-O0`.**
   `cppFlags += "-O3"` in `build.gradle.kts` applies only to the app's own two

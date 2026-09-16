@@ -72,6 +72,10 @@ target_include_directories(elias PRIVATE
 target_compile_features(elias PRIVATE cxx_std_17)
 target_compile_options(elias PRIVATE -O3 -fvisibility=hidden)
 
+string(TIMESTAMP ELIAS_STAMP "%Y%m%d-%H%M" UTC)
+target_compile_definitions(elias PRIVATE
+    ELIAS_BUILD_STAMP="${ELIAS_STAMP} ${ELIAS_ARM_ARCH}")
+
 target_link_libraries(elias
     llama
     ggml

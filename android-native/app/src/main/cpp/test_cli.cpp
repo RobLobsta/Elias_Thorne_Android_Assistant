@@ -47,6 +47,8 @@ int main(int argc, char ** argv) {
     elias::Params params;
     params.n_threads = 4;
     params.n_predict = 96;
+    if (const char * v = getenv("ELIAS_MMAP"))        params.use_mmap       = atoi(v) != 0;
+    if (const char * v = getenv("ELIAS_THREADS"))     params.n_threads      = atoi(v);
     if (const char * v = getenv("ELIAS_PENALTY"))     params.repeat_penalty = atof(v);
     if (const char * v = getenv("ELIAS_TEMP"))        params.temperature    = atof(v);
     if (const char * v = getenv("ELIAS_PENALTY_LAST")) params.repeat_last_n  = atoi(v);
@@ -70,6 +72,7 @@ int main(int argc, char ** argv) {
 
     for (int i = 2; i < argc; ++i) {
         chat.push_back({"user", argv[i]});
+        if (i == 2) printf("cpu: %s\n", elias::cpu_features().c_str());
         printf("\nYOU:   %s\nELIAS: ", argv[i]);
         fflush(stdout);
 
@@ -96,6 +99,9 @@ int main(int argc, char ** argv) {
         printf("\n       [%d tokens, %.1f s, %.1f tok/s, utf8 %s, reply %s]\n", tokens, secs,
                tokens / secs, bad_pieces == 0 ? "ok" : "BROKEN",
                valid_utf8(reply) ? "ok" : "BROKEN");
+        const auto st = model->last_stats();
+        printf("       prompt %d tok @ %.1f tok/s | generate %d tok @ %.2f tok/s\n",
+               st.n_prompt, st.prompt_tok_s(), st.n_eval, st.eval_tok_s());
         chat.push_back({"assistant", reply});
     }
 

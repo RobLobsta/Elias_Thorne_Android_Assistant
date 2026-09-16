@@ -69,6 +69,12 @@ class LlamaBridge {
         )
     }
 
+    /**
+     * Facts about the running model: build stamp, CPU features actually present,
+     * and prompt-eval versus generation speed measured separately.
+     */
+    fun diagnostics(): String = nativeDiagnostics(handle)
+
     /** Ask an in-flight [generate] to stop. Safe from any thread. */
     fun stop() {
         val h = handle
@@ -97,6 +103,7 @@ class LlamaBridge {
         listener: TokenListener,
     ): String
 
+    private external fun nativeDiagnostics(handle: Long): String
     private external fun nativeStop(handle: Long)
     private external fun nativeFree(handle: Long)
 

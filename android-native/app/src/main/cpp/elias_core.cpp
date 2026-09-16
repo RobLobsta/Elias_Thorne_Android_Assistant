@@ -1,6 +1,9 @@
 #include "elias_core.h"
 
 #include "llama.h"
+#include "ggml-cpu.h"
+
+#include <cstdio>
 
 #include <algorithm>
 #include <atomic>
@@ -94,6 +97,8 @@ std::string render_prompt(const ::llama_model * model, const std::vector<Message
 }
 
 struct Model::Impl {
+    Stats stats;
+    int   n_threads = 0;
     llama_model   * model = nullptr;
     llama_context * ctx   = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -150,7 +155,7 @@ Model * Model::load(const std::string & gguf_path, const Params & params, std::s
     mparams.n_gpu_layers = 0;
     // mmap is the reason this fits a 4 GB phone: the ~1.2 GB of weights stay
     // file-backed and evictable instead of becoming dirty anonymous pages.
-    mparams.use_mmap  = true;
+    mparams.use_mmap  = params.use_mmap;
     mparams.use_mlock = false;
 
     llama_model * model = llama_model_load_from_file(gguf_path.c_str(), mparams);
@@ -164,6 +169,9 @@ Model * Model::load(const std::string & gguf_path, const Params & params, std::s
     cparams.n_batch   = 512;
     cparams.n_threads = params.n_threads;
     cparams.n_threads_batch = params.n_threads;
+    // Defaults to true, which silently zeroes every perf counter — and the
+    // prompt-eval vs generation split is the whole diagnostic.
+    cparams.no_perf = false;
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
@@ -178,7 +186,38 @@ Model * Model::load(const std::string & gguf_path, const Params & params, std::s
     m->impl_->ctx   = ctx;
     m->impl_->vocab = llama_model_get_vocab(model);
     m->impl_->stop_ids = resolve_stop_tokens(m->impl_->vocab);
+    m->impl_->n_threads = params.n_threads;
     return m;
+}
+
+std::string cpu_features() {
+    std::string out;
+    auto add = [&](const char * name, int on) {
+        if (!out.empty()) out += " ";
+        out += name;
+        out += on ? "=yes" : "=NO";
+    };
+    add("neon",    ggml_cpu_has_neon());
+    add("dotprod", ggml_cpu_has_dotprod());
+    add("i8mm",    ggml_cpu_has_matmul_int8());
+    add("fp16va",  ggml_cpu_has_fp16_va());
+    return out;
+}
+
+Stats Model::last_stats() const {
+    return impl_ ? impl_->stats : Stats{};
+}
+
+std::string Model::describe() const {
+    if (!impl_) return "no model";
+    char buf[512];
+    const auto size_bytes = llama_model_size(impl_->model);
+    char desc[256] = {0};
+    llama_model_desc(impl_->model, desc, sizeof(desc));
+    snprintf(buf, sizeof(buf), "%s | %.2f GB | ctx %d | %d threads | %s",
+             desc, size_bytes / 1e9, (int) llama_n_ctx(impl_->ctx), impl_->n_threads,
+             cpu_features().c_str());
+    return buf;
 }
 
 int Model::context_size() const {
@@ -297,6 +336,15 @@ std::string Model::generate(const std::vector<Message> & messages, const Params 
     }
 
     llama_sampler_free(smpl);
+
+    {
+        const auto p = llama_perf_context(impl_->ctx);
+        impl_->stats.prompt_ms = p.t_p_eval_ms;
+        impl_->stats.eval_ms   = p.t_eval_ms;
+        impl_->stats.n_prompt  = p.n_p_eval;
+        impl_->stats.n_eval    = p.n_eval;
+        llama_perf_context_reset(impl_->ctx);
+    }
 
     // A reply cut short by the token budget can end mid-character; the caller
     // passes this straight to NewStringUTF, so it must be whole.

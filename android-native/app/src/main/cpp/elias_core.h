@@ -28,6 +28,17 @@ struct Params {
     float repeat_penalty = 1.25f;
     int   repeat_last_n  = 256;
     uint32_t seed     = 0xFFFFFFFF;  // LLAMA_DEFAULT_SEED
+    /**
+     * Map the weights from the file, or read them into anonymous memory.
+     *
+     * mmap keeps resident memory low by letting the kernel drop the model's
+     * pages under pressure — which is exactly the problem on a device that is
+     * always under pressure. Every dropped page is re-read from flash on the
+     * next token, and generation touches the whole model per token. Reading the
+     * weights in instead costs the full footprint up front, but Android can
+     * compress anonymous pages into zram rather than discarding them.
+     */
+    bool use_mmap = true;
 };
 
 /** A turn of conversation. `role` is "system", "user" or "assistant". */
@@ -56,6 +67,27 @@ std::string render_prompt(const std::vector<Message> & messages);
  */
 std::string render_prompt(const ::llama_model * model, const std::vector<Message> & messages);
 
+/**
+ * Timings for the last generate(), split into the two phases.
+ *
+ * The split is the diagnostic that matters. Prompt evaluation is compute-bound
+ * and reuses each weight across many tokens at once; generation re-reads the
+ * whole model per token and is bound by memory bandwidth. A build compiled
+ * badly makes both slow together. A device that cannot keep the weights
+ * resident makes only generation slow, by a lot — so the ratio says which.
+ */
+struct Stats {
+    double prompt_ms   = 0;
+    double eval_ms     = 0;
+    int    n_prompt    = 0;
+    int    n_eval      = 0;
+    double prompt_tok_s() const { return n_prompt && prompt_ms > 0 ? n_prompt * 1000.0 / prompt_ms : 0; }
+    double eval_tok_s()   const { return n_eval   && eval_ms   > 0 ? n_eval   * 1000.0 / eval_ms   : 0; }
+};
+
+/** What the CPU actually reports at runtime, which is not what was compiled. */
+std::string cpu_features();
+
 /** Called for each decoded token. Return false to stop generation. */
 using TokenCallback = std::function<bool(const std::string & piece)>;
 
@@ -77,6 +109,12 @@ public:
 
     /** Ask an in-flight generate() to stop. Safe to call from another thread. */
     void request_stop();
+
+    /** Timings from the most recent generate(). */
+    Stats last_stats() const;
+
+    /** One line describing the loaded model and how it is being run. */
+    std::string describe() const;
 
     int  context_size() const;
 
