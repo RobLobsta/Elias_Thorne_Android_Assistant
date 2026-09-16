@@ -25,3 +25,11 @@ android/assetlinks.json
 
 # ONNX Runtime WASM binaries, staged from node_modules at build time.
 public/ort/
+
+# Android native app build output
+android-native/build/
+android-native/app/build/
+android-native/.gradle/
+android-native/local.properties
+android-native/*.gguf
+android-native/app/.cxx/
